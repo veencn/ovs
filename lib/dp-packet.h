@@ -151,6 +151,7 @@ struct dp_packet {
     ovs_be32 packet_type;          /* Packet type as defined in OpenFlow */
     enum OVS_PACKED_ENUM dp_packet_offload_mask offloads;
                                    /* Checksums status and offloads. */
+    uint64_t rx_tsc;               /* @veencn_260223: RX timestamp (TSC). */
     union {
         struct pkt_metadata md;
         uint64_t data[DP_PACKET_CONTEXT_SIZE / 8];
@@ -159,6 +160,19 @@ struct dp_packet {
 
 BUILD_ASSERT_DECL(MEMBER_SIZEOF(struct dp_packet, offloads)
                   == sizeof(uint32_t));
+
+/* @veencn_260223: RX timestamp accessors for latency measurement. */
+static inline uint64_t
+dp_packet_get_rx_tsc(const struct dp_packet *p)
+{
+    return p->rx_tsc;
+}
+
+static inline void
+dp_packet_set_rx_tsc(struct dp_packet *p, uint64_t tsc)
+{
+    p->rx_tsc = tsc;
+}
 
 #if HAVE_AF_XDP
 struct dp_packet_afxdp {

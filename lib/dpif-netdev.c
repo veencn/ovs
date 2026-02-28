@@ -14,11 +14,28 @@
  * limitations under the License.
  */
 
+/*
+ * dpif-netdev.c — OVS 用户空间数据路径（datapath）核心实现。
+ *
+ * 本文件实现基于 netdev 的用户空间数据路径（即 DPDK datapath），
+ * 是 OVS-DPDK 的核心模块。与内核数据路径（dpif-netlink）不同，
+ * 此数据路径完全运行在用户空间，使用 PMD（Poll Mode Driver）线程
+ * 进行高速轮询收发包，避免内核态-用户态切换开销。
+ *
+ * 主要功能：
+ * - PMD 线程管理：创建、销毁、调度轮询线程
+ * - 多级流表：EMC（精确匹配缓存）→ SMC（签名匹配缓存）→ dpcls（通配符分类器）
+ * - 收发包路径：netdev 收包 → miniflow 提取 → 流表查找 → 执行 action → 发包
+ * - 端口管理：添加/删除端口、RXQ 到 PMD 的分配
+ * - Meter 计量：QoS 速率限制
+ * - 连接跟踪：与 conntrack 模块集成
+ * - 自动负载均衡：RXQ 在 PMD 线程间的动态重分配
+ */
 #include <config.h>
-#include "dpif-netdev.h"
-#include "dpif-netdev-private.h"
-#include "dpif-netdev-private-dfc.h"
-#include "dpif-offload.h"
+#include "dpif-netdev.h"           /* 本模块对外接口声明 */
+#include "dpif-netdev-private.h"   /* 内部私有数据结构（PMD 线程、流表等） */
+#include "dpif-netdev-private-dfc.h" /* DFC（数据路径流缓存）私有结构 */
+#include "dpif-offload.h"          /* 硬件卸载相关接口 */
 
 #include <ctype.h>
 #include <errno.h>
@@ -88,131 +105,341 @@
 #include "util.h"
 #include "uuid.h"
 
+/* 定义本模块日志名为 dpif_netdev，
+ * 可通过 ovs-appctl vlog/set dpif_netdev:dbg 调整日志级别。 */
 VLOG_DEFINE_THIS_MODULE(dpif_netdev);
 
+/* @veencn_260223: Latency measurement helper functions. */
+/* 延迟测量辅助函数：用于测量 PMD 各处理阶段的时延（CPU 周期数），
+ * 包括 miniflow 提取、EMC/SMC/dpcls 查找、upcall、action 执行等阶段。
+ * 通过 ovs-appctl dpif-netdev/latency-* 命令控制。 */
+
+/* 将 CPU 时钟周期数转换为纳秒。 */
+static inline uint64_t
+latency_cycles_to_ns(uint64_t cycles)
+{
+    uint64_t hz = pmd_perf_get_tsc_hz();
+    return hz > 1 ? cycles * 1000000000ULL / hz : 0;
+}
+
+/* 更新某个阶段的延迟统计：累加计数/总周期数，更新最小/最大值，
+ * 并将转换后的纳秒值放入直方图桶中（<100ns, 100-200ns, ... >=100us）。 */
+static inline void
+latency_stage_update(struct latency_stage_stats *stage, uint64_t cycles)
+{
+    stage->count++;
+    stage->total_cycles += cycles;
+    if (cycles < stage->min_cycles) {
+        stage->min_cycles = cycles;
+    }
+    if (cycles > stage->max_cycles) {
+        stage->max_cycles = cycles;
+    }
+
+    uint64_t ns = latency_cycles_to_ns(cycles);
+    int bucket;
+    if (ns < 100) {
+        bucket = 0;
+    } else if (ns < 200) {
+        bucket = 1;
+    } else if (ns < 500) {
+        bucket = 2;
+    } else if (ns < 1000) {
+        bucket = 3;
+    } else if (ns < 10000) {
+        bucket = 4;
+    } else if (ns < 100000) {
+        bucket = 5;
+    } else {
+        bucket = 6;
+    }
+    stage->histogram[bucket]++;
+}
+
+/* 初始化延迟统计结构，将所有阶段的 min_cycles 设为 UINT64_MAX。 */
+static void
+latency_stats_init(struct pmd_latency_stats *s)
+{
+    memset(s, 0, sizeof *s);
+    s->enabled = false;
+    s->miniflow.min_cycles = UINT64_MAX;
+    s->emc_lookup.min_cycles = UINT64_MAX;
+    s->smc_lookup.min_cycles = UINT64_MAX;
+    s->dpcls_lookup.min_cycles = UINT64_MAX;
+    s->upcall.min_cycles = UINT64_MAX;
+    s->action_exec.min_cycles = UINT64_MAX;
+    s->total.min_cycles = UINT64_MAX;
+}
+
+/* 清除延迟统计数据但保留 enabled 状态。 */
+static void
+latency_stats_clear(struct pmd_latency_stats *s)
+{
+    bool was_enabled = s->enabled;
+    latency_stats_init(s);
+    s->enabled = was_enabled;
+}
+/* 核心单包测量：从 rx_tsc 到 t_now 的延迟。
+ * 返回 true 表示记录成功（rx_tsc 有效），调用者可据此决定是否计数。 */
+static inline bool
+latency_mark_pkt(struct latency_stage_stats *stage,
+                 const struct dp_packet *pkt, uint64_t t_now)
+{
+    uint64_t rx = dp_packet_get_rx_tsc(pkt);
+    if (rx) {
+        latency_stage_update(stage, t_now - rx);
+        return true;
+    }
+    return false;
+}
+
+/* 批量计算端到端总延迟：遍历 batch，对每个包算 t_end - rx_tsc。 */
+static inline void
+latency_batch_total(struct pmd_latency_stats *ls,
+                    struct dp_packet_batch *batch, uint64_t t_end)
+{
+    struct dp_packet *pkt;
+    DP_PACKET_BATCH_FOR_EACH (i, pkt, batch) {
+        latency_mark_pkt(&ls->total, pkt, t_end);
+    }
+}
+
+/* @veencn_260223: Latency instrumentation macros.
+ *
+ * 统一入口: LATENCY(pmd, TYPE, ...)
+ * TYPE: STAMP_BATCH, MARK, MARK_BATCH, BEGIN, END
+ *
+ * _LATENCY_END 内部变量 _lend 保存结束时间戳，
+ * 可在可变参数中引用（如 latency_batch_total(..., _lend)）。 */
+
+#define LATENCY(PMD, TYPE, ...) _LATENCY_##TYPE(PMD, ##__VA_ARGS__)
+
+/* T1: 批量给包打 rx_tsc 时间戳 */
+#define _LATENCY_STAMP_BATCH(PMD, BATCH)                                \
+    do {                                                                \
+        if (OVS_UNLIKELY((PMD)->latency_stats.enabled)) {              \
+            struct dp_packet *_lpkt;                                    \
+            uint64_t _tsc = cycles_counter_update(&(PMD)->perf_stats); \
+            DP_PACKET_BATCH_FOR_EACH (_li, _lpkt, (BATCH)) {          \
+                dp_packet_set_rx_tsc(_lpkt, _tsc);                     \
+            }                                                           \
+        }                                                               \
+    } while (0)
+
+/* T2/T3a/T3b: 单包测量（可变参数仅在 rx_tsc 有效时执行） */
+#define _LATENCY_MARK(PMD, PKT, STAGE, ...)                             \
+    do {                                                                \
+        if (OVS_UNLIKELY((PMD)->latency_stats.enabled)) {              \
+            uint64_t _now = cycles_counter_update(&(PMD)->perf_stats); \
+            if (latency_mark_pkt(&(PMD)->latency_stats.STAGE,          \
+                                 (PKT), _now)) {                        \
+                __VA_ARGS__;                                            \
+            }                                                           \
+        }                                                               \
+    } while (0)
+
+/* T3c: 批量测量 + 条件过滤 + 命中计数 */
+#define _LATENCY_MARK_BATCH(PMD, BATCH, STAGE, COUNTER, FILTER)         \
+    do {                                                                \
+        if (OVS_UNLIKELY((PMD)->latency_stats.enabled)) {              \
+            struct dp_packet *_lpkt;                                    \
+            uint64_t _now = cycles_counter_update(&(PMD)->perf_stats); \
+            DP_PACKET_BATCH_FOR_EACH (_li, _lpkt, (BATCH)) {          \
+                if ((FILTER)[_li]                                       \
+                    && latency_mark_pkt(&(PMD)->latency_stats.STAGE,   \
+                                        _lpkt, _now)) {                 \
+                    (PMD)->latency_stats.COUNTER++;                     \
+                }                                                       \
+            }                                                           \
+        }                                                               \
+    } while (0)
+
+/* T3d前/T4前: 区间测量起点（声明变量，不能用 do-while 包装） */
+#define _LATENCY_BEGIN(PMD, VAR)                                        \
+    uint64_t VAR = 0;                                                   \
+    if (OVS_UNLIKELY((PMD)->latency_stats.enabled)) {                  \
+        VAR = cycles_counter_update(&(PMD)->perf_stats);               \
+    }
+
+/* T3d后/T4后: 区间测量终点（_lend 可在可变参数中引用） */
+#define _LATENCY_END(PMD, VAR, STAGE, ...)                              \
+    do {                                                                \
+        if (OVS_UNLIKELY((PMD)->latency_stats.enabled) && (VAR)) {    \
+            uint64_t _lend = cycles_counter_update(                     \
+                &(PMD)->perf_stats);                                    \
+            latency_stage_update(&(PMD)->latency_stats.STAGE,          \
+                                 _lend - (VAR));                        \
+            __VA_ARGS__;                                                \
+        }                                                               \
+    } while (0)
+
+/* @veencn_260223 end: latency helpers & macros */
+
 /* Auto Load Balancing Defaults */
-#define ALB_IMPROVEMENT_THRESHOLD    25
-#define ALB_LOAD_THRESHOLD           95
+/* 自动负载均衡（ALB）默认参数：
+ * ALB 会周期性检查各 PMD 线程的 RXQ 负载，
+ * 当负载不均时自动重新分配 RXQ 到不同的 PMD 线程。 */
+#define ALB_IMPROVEMENT_THRESHOLD    25    /* 重分配后负载改善至少 25% 才生效 */
+#define ALB_LOAD_THRESHOLD           95    /* PMD 负载超过 95% 时触发重分配 */
 #define ALB_REBALANCE_INTERVAL       1     /* 1 Min */
 #define MAX_ALB_REBALANCE_INTERVAL   20000 /* 20000 Min */
-#define MIN_TO_MSEC                  60000
+#define MIN_TO_MSEC                  60000 /* 分钟转毫秒 */
 
-#define FLOW_DUMP_MAX_BATCH 50
+#define FLOW_DUMP_MAX_BATCH 50  /* 流表 dump 时每次最多取 50 条 */
 /* Use per thread recirc_depth to prevent recirculation loop. */
+/* 每线程 recirculation 深度计数器，防止无限循环重入。 */
 #define MAX_RECIRC_DEPTH 8
 DEFINE_STATIC_PER_THREAD_DATA(uint32_t, recirc_depth, 0)
 
 /* Use instant packet send by default. */
+/* 默认立即发送数据包（不做 output batching）。
+ * 设为非零值可延迟发送，以攒批提升吞吐量。 */
 #define DEFAULT_TX_FLUSH_INTERVAL 0
 
 /* Configuration parameters. */
-enum { MAX_METERS = 1 << 18 };  /* Maximum number of meters. */
-enum { MAX_BANDS = 8 };         /* Maximum number of bands / meter. */
+/* 配置参数上限。 */
+enum { MAX_METERS = 1 << 18 };  /* Maximum number of meters. */  /* 最大 meter 数量 262144 */
+enum { MAX_BANDS = 8 };         /* Maximum number of bands / meter. */  /* 每个 meter 最多 8 个 band */
 
-COVERAGE_DEFINE(datapath_drop_meter);
-COVERAGE_DEFINE(datapath_drop_upcall_error);
-COVERAGE_DEFINE(datapath_drop_lock_error);
-COVERAGE_DEFINE(datapath_drop_userspace_action_error);
-COVERAGE_DEFINE(datapath_drop_tunnel_push_error);
-COVERAGE_DEFINE(datapath_drop_tunnel_pop_error);
-COVERAGE_DEFINE(datapath_drop_recirc_error);
-COVERAGE_DEFINE(datapath_drop_invalid_port);
-COVERAGE_DEFINE(datapath_drop_invalid_bond);
-COVERAGE_DEFINE(datapath_drop_invalid_tnl_port);
-COVERAGE_DEFINE(datapath_drop_rx_invalid_packet);
-COVERAGE_DEFINE(datapath_drop_hw_post_process);
-COVERAGE_DEFINE(datapath_drop_hw_post_process_consumed);
+/* 数据路径丢包统计计数器定义。
+ * 每种丢包原因对应一个 COVERAGE 计数器，
+ * 可通过 ovs-appctl coverage/show 查看各类丢包数量。 */
+COVERAGE_DEFINE(datapath_drop_meter);           /* meter 限速丢包 */
+COVERAGE_DEFINE(datapath_drop_upcall_error);    /* upcall 失败丢包 */
+COVERAGE_DEFINE(datapath_drop_lock_error);      /* 获取锁失败丢包 */
+COVERAGE_DEFINE(datapath_drop_userspace_action_error); /* userspace action 失败 */
+COVERAGE_DEFINE(datapath_drop_tunnel_push_error);  /* 隧道封装失败 */
+COVERAGE_DEFINE(datapath_drop_tunnel_pop_error);   /* 隧道解封装失败 */
+COVERAGE_DEFINE(datapath_drop_recirc_error);       /* recirculation 失败 */
+COVERAGE_DEFINE(datapath_drop_invalid_port);       /* 无效端口 */
+COVERAGE_DEFINE(datapath_drop_invalid_bond);       /* 无效 bond */
+COVERAGE_DEFINE(datapath_drop_invalid_tnl_port);   /* 无效隧道端口 */
+COVERAGE_DEFINE(datapath_drop_rx_invalid_packet);  /* 收到无效报文 */
+COVERAGE_DEFINE(datapath_drop_hw_post_process);    /* 硬件后处理丢包 */
+COVERAGE_DEFINE(datapath_drop_hw_post_process_consumed); /* 硬件后处理已消费 */
 
 /* Protects against changes to 'dp_netdevs'. */
+/* 全局互斥锁，保护 dp_netdevs 哈希表的并发修改。 */
 struct ovs_mutex dp_netdev_mutex = OVS_MUTEX_INITIALIZER;
 
 /* Contains all 'struct dp_netdev's. */
+/* 全局字符串哈希表，存储所有 dp_netdev 实例（按名称索引）。
+ * 通常只有一个 datapath（如 "netdev@ovs-netdev"）。 */
 static struct shash dp_netdevs OVS_GUARDED_BY(dp_netdev_mutex)
     = SHASH_INITIALIZER(&dp_netdevs);
 
+/* upcall 日志速率限制：每秒最多 600 条日志。 */
 static struct vlog_rate_limit upcall_rl = VLOG_RATE_LIMIT_INIT(600, 600);
 
+/* 用户空间 datapath 支持的连接跟踪状态标志位掩码。 */
 #define DP_NETDEV_CS_SUPPORTED_MASK (CS_NEW | CS_ESTABLISHED | CS_RELATED \
                                      | CS_INVALID | CS_REPLY_DIR | CS_TRACKED \
                                      | CS_SRC_NAT | CS_DST_NAT)
 #define DP_NETDEV_CS_UNSUPPORTED_MASK (~(uint32_t)DP_NETDEV_CS_SUPPORTED_MASK)
 
+/* 用户空间 datapath 的特性支持声明。
+ * 表示本 datapath 支持的 ODP 功能：VLAN/MPLS 无限层数、
+ * recirculation、conntrack 全部字段等。 */
 static struct odp_support dp_netdev_support = {
-    .max_vlan_headers = SIZE_MAX,
-    .max_mpls_depth = SIZE_MAX,
-    .recirc = true,
-    .ct_state = true,
-    .ct_zone = true,
-    .ct_mark = true,
-    .ct_label = true,
-    .ct_state_nat = true,
-    .ct_orig_tuple = true,
-    .ct_orig_tuple6 = true,
+    .max_vlan_headers = SIZE_MAX, /* 支持任意数量 VLAN 头 */
+    .max_mpls_depth = SIZE_MAX,   /* 支持任意深度 MPLS 标签栈 */
+    .recirc = true,               /* 支持 recirculation（重入处理） */
+    .ct_state = true,             /* 支持 conntrack 状态匹配 */
+    .ct_zone = true,              /* 支持 conntrack zone */
+    .ct_mark = true,              /* 支持 conntrack mark */
+    .ct_label = true,             /* 支持 conntrack label */
+    .ct_state_nat = true,         /* 支持 conntrack NAT 状态 */
+    .ct_orig_tuple = true,        /* 支持 conntrack 原始五元组(IPv4) */
+    .ct_orig_tuple6 = true,       /* 支持 conntrack 原始五元组(IPv6) */
 };
 
 
 /* Simple non-wildcarding single-priority classifier. */
+/* 简单非通配、单优先级分类器（dpcls）相关常量定义。 */
 
 /* Time in microseconds between successive optimizations of the dpcls
  * subtable vector */
+/* dpcls 子表向量优化间隔：每 1 秒重新排序子表，
+ * 将命中率高的子表排在前面以加速查找。 */
 #define DPCLS_OPTIMIZATION_INTERVAL 1000000LL
 
 /* Time in microseconds of the interval in which rxq processing cycles used
  * in rxq to pmd assignments is measured and stored. */
+/* RXQ 处理周期采样间隔：每 5 秒记录一次各 RXQ 消耗的 CPU 周期数，
+ * 用于负载均衡时评估 RXQ 的负载大小。 */
 #define PMD_INTERVAL_LEN 5000000LL
 /* For converting PMD_INTERVAL_LEN to secs. */
 #define INTERVAL_USEC_TO_SEC 1000000LL
 
 /* Number of intervals for which cycles are stored
  * and used during rxq to pmd assignment. */
+/* 保存最近 12 个采样间隔的数据（共 60 秒），
+ * 用于 RXQ 分配时的负载统计。 */
 #define PMD_INTERVAL_MAX 12
 
 /* Time in microseconds to try RCU quiescing. */
+/* PMD 线程每 10ms 尝试一次 RCU 静默期（quiescent state），
+ * 使其他线程能安全释放 RCU 保护的资源。 */
 #define PMD_RCU_QUIESCE_INTERVAL 10000LL
 
 /* Timer resolution for PMD threads in nanoseconds. */
+/* PMD 线程定时器精度：1 微秒。 */
 #define PMD_TIMER_RES_NS 1000
 
 /* Number of pkts Rx on an interface that will stop pmd thread sleeping. */
+/* PMD 休眠唤醒阈值：收到超过此数量的包就停止休眠。 */
 #define PMD_SLEEP_THRESH (NETDEV_MAX_BURST / 2)
 /* Time in uS to increment a pmd thread sleep time. */
+/* PMD 休眠时间递增步长：每次增加 1 微秒。 */
 #define PMD_SLEEP_INC_US 1
 
+/* PMD 线程休眠配置：允许为特定 core 设置最大休眠时间（微秒），
+ * 用于在低负载时降低 CPU 使用率。 */
 struct pmd_sleep {
-    unsigned core_id;
-    uint64_t max_sleep;
+    unsigned core_id;   /* 绑定的 CPU 核心 ID */
+    uint64_t max_sleep; /* 最大休眠时间（微秒） */
 };
 
+/* dpcls — 数据路径分类器（Datapath Classifier）。
+ * 每个入端口（in_port）对应一个 dpcls 实例，存储该端口的所有通配符流表规则。
+ * 内部使用多个子表（subtable），每个子表对应一种 mask 模式。
+ * 查找时按 pvector 排序依次匹配子表，命中率高的子表排在前面。 */
 struct dpcls {
     struct cmap_node node;      /* Within dp_netdev_pmd_thread.classifiers */
-    odp_port_t in_port;
-    struct cmap subtables_map;
-    struct pvector subtables;
+    odp_port_t in_port;         /* 此分类器对应的入端口号 */
+    struct cmap subtables_map;  /* 子表哈希映射（按 mask 索引） */
+    struct pvector subtables;   /* 子表优先级向量（按命中率排序） */
 };
 
 /* Data structure to keep packet order till fastpath processing. */
+/* 数据包-流表映射：在批处理中将每个包与其匹配的流表项关联，
+ * 保持包的原始顺序直到快速路径处理完成。 */
 struct dp_packet_flow_map {
-    struct dp_packet *packet;
-    struct dp_netdev_flow *flow;
-    uint16_t tcp_flags;
+    struct dp_packet *packet;       /* 指向数据包的指针 */
+    struct dp_netdev_flow *flow;    /* 匹配到的流表项（NULL 表示未命中） */
+    uint16_t tcp_flags;             /* 提取的 TCP 标志位 */
 };
 
-static void dpcls_init(struct dpcls *);
-static void dpcls_destroy(struct dpcls *);
-static void dpcls_sort_subtable_vector(struct dpcls *);
-static uint32_t dpcls_subtable_lookup_reprobe(struct dpcls *cls);
+/* dpcls 分类器操作函数的前向声明。 */
+static void dpcls_init(struct dpcls *);       /* 初始化分类器 */
+static void dpcls_destroy(struct dpcls *);    /* 销毁分类器 */
+static void dpcls_sort_subtable_vector(struct dpcls *);  /* 按命中率排序子表 */
+static uint32_t dpcls_subtable_lookup_reprobe(struct dpcls *cls); /* 重新探测子表查找函数 */
 static void dpcls_insert(struct dpcls *, struct dpcls_rule *,
-                         const struct netdev_flow_key *mask);
-static void dpcls_remove(struct dpcls *, struct dpcls_rule *);
+                         const struct netdev_flow_key *mask); /* 插入规则 */
+static void dpcls_remove(struct dpcls *, struct dpcls_rule *); /* 删除规则 */
 
 /* Set of supported meter flags */
+/* 支持的 meter 标志：统计、按包计速、按 Kbps 计速、突发。 */
 #define DP_SUPPORTED_METER_FLAGS_MASK \
     (OFPMF13_STATS | OFPMF13_PKTPS | OFPMF13_KBPS | OFPMF13_BURST)
 
 /* Set of supported meter band types */
+/* 支持的 meter band 类型：仅支持 DROP（丢弃）。 */
 #define DP_SUPPORTED_METER_BAND_TYPES           \
     ( 1 << OFPMBT13_DROP )
 
+/* Meter band：meter 的一个速率段，超过此速率则执行对应动作（如丢弃）。 */
 struct dp_meter_band {
     uint32_t rate;
     uint32_t burst_size;
@@ -222,36 +449,45 @@ struct dp_meter_band {
     atomic_uint64_t byte_count;
 };
 
+/* dp_meter — OpenFlow meter 实例。
+ * 用于 QoS 速率限制：对匹配流量进行计量，超速时执行 band 动作。 */
 struct dp_meter {
-    struct cmap_node node;
-    uint32_t id;
-    uint16_t flags;
-    uint16_t n_bands;
-    uint32_t max_delta_t;
+    struct cmap_node node;          /* 在 dp_netdev.meters 哈希表中的节点 */
+    uint32_t id;                    /* meter ID */
+    uint16_t flags;                 /* meter 标志（PKTPS/KBPS/BURST 等） */
+    uint16_t n_bands;               /* band 数量 */
+    uint32_t max_delta_t;           /* 最大时间差（防止溢出） */
     atomic_uint64_t used;  /* Time of a last use in milliseconds. */
-    atomic_uint64_t packet_count;
-    atomic_uint64_t byte_count;
-    struct dp_meter_band bands[];
+    atomic_uint64_t packet_count;   /* 累计处理的包数 */
+    atomic_uint64_t byte_count;     /* 累计处理的字节数 */
+    struct dp_meter_band bands[];   /* 柔性数组：包含 n_bands 个 band */
 };
 
+/* 自动负载均衡（Auto Load Balancing）状态。
+ * 周期性检测各 PMD 线程的 RXQ 负载分布，
+ * 当 PMD 负载超过阈值时自动重分配 RXQ。 */
 struct pmd_auto_lb {
-    bool do_dry_run;
-    bool recheck_config;
+    bool do_dry_run;                     /* 是否先模拟运行（不实际迁移） */
+    bool recheck_config;                 /* 是否需要重新检查配置 */
     bool is_enabled;            /* Current status of Auto load balancing. */
-    uint64_t rebalance_intvl;
-    uint64_t rebalance_poll_timer;
-    uint8_t rebalance_improve_thresh;
-    atomic_uint8_t rebalance_load_thresh;
+    uint64_t rebalance_intvl;            /* 重平衡检查间隔（毫秒） */
+    uint64_t rebalance_poll_timer;       /* 下次检查的时间戳 */
+    uint8_t rebalance_improve_thresh;    /* 改善阈值百分比 */
+    atomic_uint8_t rebalance_load_thresh; /* 负载触发阈值百分比 */
 };
 
+/* RXQ 到 PMD 线程的分配策略枚举。 */
 enum sched_assignment_type {
-    SCHED_ROUNDROBIN,
-    SCHED_CYCLES, /* Default.*/
-    SCHED_GROUP
+    SCHED_ROUNDROBIN,  /* 轮询分配：按顺序将 RXQ 分配给各 PMD */
+    SCHED_CYCLES, /* Default.*/  /* 基于周期的分配（默认）：按 CPU 周期消耗均衡 */
+    SCHED_GROUP        /* 分组分配：将相同端口的 RXQ 分给同一 PMD */
 };
 
 /* Datapath based on the network device interface from netdev.h.
  *
+ * dp_netdev — 用户空间数据路径的核心结构体。
+ * 每个 OVS bridge 对应一个 dp_netdev 实例，管理所有端口、PMD 线程、
+ * 流表、meter、bond 等资源。通常整个系统只有一个 datapath。
  *
  * Thread-safety
  * =============
@@ -260,11 +496,11 @@ enum sched_assignment_type {
  * requires synchronization, as noted in more detail below.
  *
  * Acquisition order is, from outermost to innermost:
- *
- *    dp_netdev_mutex (global)
- *    port_rwlock
- *    bond_mutex
- *    non_pmd_mutex
+ * 锁获取顺序（从外到内）：
+ *    dp_netdev_mutex (global)  — 全局锁，保护 dp_netdevs
+ *    port_rwlock               — 读写锁，保护端口列表
+ *    bond_mutex                — 保护 bond 配置
+ *    non_pmd_mutex             — 保护 non-PMD 线程
  */
 struct dp_netdev {
     const struct dpif_class *const class;
@@ -348,18 +584,25 @@ static struct dp_netdev_port *dp_netdev_lookup_port(const struct dp_netdev *dp,
                                                     odp_port_t)
     OVS_REQ_RDLOCK(dp->port_rwlock);
 
+/* RXQ 处理周期计数器类型。
+ * 用于统计每个 RXQ 消耗的 CPU 周期数，为负载均衡提供依据。 */
 enum rxq_cycles_counter_type {
     RXQ_CYCLES_PROC_CURR,       /* Cycles spent successfully polling and
                                    processing packets during the current
                                    interval. */
+                                /* 当前采样间隔内轮询和处理包消耗的周期数 */
     RXQ_CYCLES_PROC_HIST,       /* Total cycles of all intervals that are used
                                    during rxq to pmd assignment. */
+                                /* 所有历史间隔的累计周期数（用于 RXQ 分配决策） */
     RXQ_N_CYCLES
 };
 
+/* XPS（Transmit Packet Steering）超时：500ms 内无流量则释放 TX 队列绑定。 */
 #define XPS_TIMEOUT 500000LL    /* In microseconds. */
 
 /* Contained by struct dp_netdev_port's 'rxqs' member.  */
+/* dp_netdev_rxq — 端口的一个接收队列。
+ * 每个物理/虚拟端口可有多个 RXQ，每个 RXQ 被分配给一个 PMD 线程轮询。 */
 struct dp_netdev_rxq {
     struct dp_netdev_port *port;
     struct netdev_rxq *rx;
@@ -378,135 +621,160 @@ struct dp_netdev_rxq {
     atomic_ullong cycles_intrvl[PMD_INTERVAL_MAX];
 };
 
+/* TX 队列请求模式枚举（用户配置）。 */
 enum txq_req_mode {
-    TXQ_REQ_MODE_THREAD,
-    TXQ_REQ_MODE_HASH,
+    TXQ_REQ_MODE_THREAD,  /* 按线程静态分配 TX 队列 */
+    TXQ_REQ_MODE_HASH,    /* 按哈希动态选择 TX 队列 */
 };
 
+/* TX 队列实际运行模式枚举。 */
 enum txq_mode {
-    TXQ_MODE_STATIC,
-    TXQ_MODE_XPS,
-    TXQ_MODE_XPS_HASH,
+    TXQ_MODE_STATIC,    /* 静态模式：每个 PMD 固定使用一个 TXQ */
+    TXQ_MODE_XPS,       /* XPS 模式：基于包的源端口选择 TXQ */
+    TXQ_MODE_XPS_HASH,  /* XPS 哈希模式：基于流哈希选择 TXQ */
 };
 
 /* A port in a netdev-based datapath. */
+/* dp_netdev_port — 数据路径中的一个端口。
+ * 对应物理网卡（dpdk 类型）、vhost 端口、internal 端口等。
+ * 每个端口包含若干 RXQ 和 TXQ。 */
 struct dp_netdev_port {
-    odp_port_t port_no;
+    odp_port_t port_no;         /* ODP 端口号 */
     enum txq_mode txq_mode;     /* static, XPS, XPS_HASH. */
     bool need_reconfigure;      /* True if we should reconfigure netdev. */
-    struct netdev *netdev;
+    struct netdev *netdev;      /* 底层网络设备抽象 */
     struct hmap_node node;      /* Node in dp_netdev's 'ports'. */
-    struct netdev_saved_flags *sf;
-    struct dp_netdev_rxq *rxqs;
+    struct netdev_saved_flags *sf; /* 保存的网络设备标志 */
+    struct dp_netdev_rxq *rxqs; /* 接收队列数组 */
     unsigned n_rxq;             /* Number of elements in 'rxqs' */
     unsigned *txq_used;         /* Number of threads that use each tx queue. */
     struct ovs_mutex txq_used_mutex;
     bool emc_enabled;           /* If true EMC will be used. */
     char *type;                 /* Port type as requested by user. */
     char *rxq_affinity_list;    /* Requested affinity of rx queues. */
-    enum txq_req_mode txq_requested_mode;
+    enum txq_req_mode txq_requested_mode; /* 用户请求的 TXQ 模式 */
 };
 
-static bool dp_netdev_flow_ref(struct dp_netdev_flow *);
+/* 流表和 action 操作的前向声明。 */
+static bool dp_netdev_flow_ref(struct dp_netdev_flow *); /* 增加流表项引用计数 */
 static int dpif_netdev_flow_from_nlattrs(const struct nlattr *, uint32_t,
-                                         struct flow *, bool);
+                                         struct flow *, bool); /* 从 netlink 属性解析流 */
 
 struct dp_netdev_actions *dp_netdev_actions_create(const struct nlattr *,
-                                                   size_t);
+                                                   size_t); /* 创建 action 列表 */
 struct dp_netdev_actions *dp_netdev_flow_get_actions(
-    const struct dp_netdev_flow *);
-static void dp_netdev_actions_free(struct dp_netdev_actions *);
+    const struct dp_netdev_flow *); /* 获取流表项的 action（RCU 安全） */
+static void dp_netdev_actions_free(struct dp_netdev_actions *); /* 释放 action */
 
+/* PMD 线程轮询的队列快照。
+ * PMD 主循环开始前从 poll_list 拷贝一份到栈上，避免加锁。 */
 struct polled_queue {
-    struct dp_netdev_rxq *rxq;
-    odp_port_t port_no;
-    bool emc_enabled;
-    bool rxq_enabled;
-    uint64_t change_seq;
+    struct dp_netdev_rxq *rxq;  /* 指向接收队列 */
+    odp_port_t port_no;         /* 端口号 */
+    bool emc_enabled;           /* 此端口是否启用 EMC */
+    bool rxq_enabled;           /* 此 RXQ 是否启用 */
+    uint64_t change_seq;        /* 端口变更序号（检测配置变化） */
 };
 
 /* Contained by struct dp_netdev_pmd_thread's 'poll_list' member. */
+/* rxq_poll — PMD 轮询列表的元素，记录哪些 RXQ 分配给了此 PMD。 */
 struct rxq_poll {
-    struct dp_netdev_rxq *rxq;
-    struct hmap_node node;
+    struct dp_netdev_rxq *rxq;  /* 待轮询的接收队列 */
+    struct hmap_node node;      /* 在 pmd->poll_list 哈希表中的节点 */
 };
 
 /* Contained by struct dp_netdev_pmd_thread's 'send_port_cache',
  * 'tnl_port_cache' or 'tx_ports'. */
+/* tx_port — PMD 线程的发送端口缓存。
+ * 每个 PMD 为其可能发往的每个端口维护一个 tx_port，
+ * 用于 output batching（攒批发送）以提升吞吐量。 */
 struct tx_port {
-    struct dp_netdev_port *port;
-    int qid;
-    long long last_used;
-    struct hmap_node node;
-    long long flush_time;
-    struct dp_packet_batch output_pkts;
+    struct dp_netdev_port *port;   /* 目标端口 */
+    int qid;                       /* 使用的 TX 队列 ID */
+    long long last_used;           /* 上次使用的时间戳（用于 XPS 超时） */
+    struct hmap_node node;         /* 哈希表节点 */
+    long long flush_time;          /* 下次强制刷新的时间 */
+    struct dp_packet_batch output_pkts;  /* 输出包的攒批缓冲 */
     struct dp_packet_batch *txq_pkts; /* Only for hash mode. */
-    struct dp_netdev_rxq *output_pkts_rxqs[NETDEV_MAX_BURST];
+    struct dp_netdev_rxq *output_pkts_rxqs[NETDEV_MAX_BURST]; /* 每个包对应的源 RXQ */
 };
 
 /* Contained by struct tx_bond 'member_buckets'. */
+/* Bond 成员条目：记录一个哈希桶对应的 bond 成员端口及流量统计。 */
 struct member_entry {
-    odp_port_t member_id;
-    atomic_ullong n_packets;
-    atomic_ullong n_bytes;
+    odp_port_t member_id;       /* 成员端口 ID */
+    atomic_ullong n_packets;    /* 此桶发送的包数 */
+    atomic_ullong n_bytes;      /* 此桶发送的字节数 */
 };
 
 /* Contained by struct dp_netdev_pmd_thread's 'tx_bonds'. */
+/* tx_bond — 数据路径中的 bond（链路聚合）。
+ * 使用哈希桶将流量分配到不同成员端口。 */
 struct tx_bond {
-    struct cmap_node node;
-    uint32_t bond_id;
-    struct member_entry member_buckets[BOND_BUCKETS];
+    struct cmap_node node;      /* 在 pmd->tx_bonds 中的节点 */
+    uint32_t bond_id;           /* bond 标识符 */
+    struct member_entry member_buckets[BOND_BUCKETS]; /* 哈希桶数组 */
 };
 
 /* Interface to netdev-based datapath. */
+/* dpif_netdev — dpif 接口的 netdev 实现。
+ * 将通用 dpif 接口"继承"并关联到具体的 dp_netdev 实例。
+ * 上层通过 dpif 指针调用虚函数表中的操作。 */
 struct dpif_netdev {
-    struct dpif dpif;
-    struct dp_netdev *dp;
-    uint64_t last_port_seq;
+    struct dpif dpif;           /* 基类：通用 dpif 接口 */
+    struct dp_netdev *dp;       /* 关联的数据路径实例 */
+    uint64_t last_port_seq;     /* 上次读取的端口变更序号 */
 };
 
+/* 以下为各子系统的静态函数前向声明。
+ * OVS_REQ_RDLOCK/WRLOCK 标注表示调用时需要持有的锁。 */
+
+/* 端口查找/管理 */
 static int get_port_by_number(struct dp_netdev *dp, odp_port_t port_no,
                               struct dp_netdev_port **portp)
-    OVS_REQ_RDLOCK(dp->port_rwlock);
+    OVS_REQ_RDLOCK(dp->port_rwlock);   /* 按端口号查找端口 */
 static int get_port_by_name(struct dp_netdev *dp, const char *devname,
                             struct dp_netdev_port **portp)
-    OVS_REQ_RDLOCK(dp->port_rwlock);
+    OVS_REQ_RDLOCK(dp->port_rwlock);   /* 按设备名查找端口 */
 static void dp_netdev_free(struct dp_netdev *)
-    OVS_REQUIRES(dp_netdev_mutex);
+    OVS_REQUIRES(dp_netdev_mutex);     /* 释放 datapath */
 static int do_add_port(struct dp_netdev *dp, const char *devname,
                        const char *type, odp_port_t port_no)
-    OVS_REQ_WRLOCK(dp->port_rwlock);
+    OVS_REQ_WRLOCK(dp->port_rwlock);   /* 添加端口到 datapath */
 static void do_del_port(struct dp_netdev *dp, struct dp_netdev_port *)
-    OVS_REQ_WRLOCK(dp->port_rwlock);
+    OVS_REQ_WRLOCK(dp->port_rwlock);   /* 从 datapath 删除端口 */
 static int dpif_netdev_open(const struct dpif_class *, const char *name,
-                            bool create, struct dpif **);
+                            bool create, struct dpif **); /* 打开/创建 dpif */
+/* 在 PMD 线程上执行给定的 action 列表。 */
 static void dp_netdev_execute_actions(struct dp_netdev_pmd_thread *pmd,
                                       struct dp_packet_batch *,
                                       bool should_steal,
                                       const struct flow *flow,
                                       const struct nlattr *actions,
                                       size_t actions_len);
+/* 将包送入 recirculation（重入处理，如 ct/bond 后续查找）。 */
 static void dp_netdev_recirculate(struct dp_netdev_pmd_thread *,
                                   struct dp_packet_batch *);
 
-static void dp_netdev_disable_upcall(struct dp_netdev *);
-static void dp_netdev_pmd_reload_done(struct dp_netdev_pmd_thread *pmd);
+/* PMD 线程管理相关前向声明 */
+static void dp_netdev_disable_upcall(struct dp_netdev *); /* 禁用 upcall */
+static void dp_netdev_pmd_reload_done(struct dp_netdev_pmd_thread *pmd); /* 通知 PMD 重载完成 */
 static void dp_netdev_configure_pmd(struct dp_netdev_pmd_thread *pmd,
                                     struct dp_netdev *dp, unsigned core_id,
-                                    int numa_id);
-static void dp_netdev_destroy_pmd(struct dp_netdev_pmd_thread *pmd);
+                                    int numa_id); /* 配置/初始化 PMD 线程 */
+static void dp_netdev_destroy_pmd(struct dp_netdev_pmd_thread *pmd); /* 销毁 PMD 线程 */
 static void dp_netdev_set_nonpmd(struct dp_netdev *dp)
-    OVS_REQ_WRLOCK(dp->port_rwlock);
+    OVS_REQ_WRLOCK(dp->port_rwlock); /* 设置 non-PMD 线程（处理非轮询操作） */
 
-static void *pmd_thread_main(void *);
+static void *pmd_thread_main(void *); /* PMD 线程主函数入口 */
 static struct dp_netdev_pmd_thread *dp_netdev_get_pmd(struct dp_netdev *dp,
-                                                      unsigned core_id);
+                                                      unsigned core_id); /* 按核心 ID 获取 PMD */
 static struct dp_netdev_pmd_thread *
-dp_netdev_pmd_get_next(struct dp_netdev *dp, struct cmap_position *pos);
+dp_netdev_pmd_get_next(struct dp_netdev *dp, struct cmap_position *pos); /* 遍历 PMD */
 static void dp_netdev_del_pmd(struct dp_netdev *dp,
-                              struct dp_netdev_pmd_thread *pmd);
-static void dp_netdev_destroy_all_pmds(struct dp_netdev *dp, bool non_pmd);
-static void dp_netdev_pmd_clear_ports(struct dp_netdev_pmd_thread *pmd);
+                              struct dp_netdev_pmd_thread *pmd); /* 删除 PMD */
+static void dp_netdev_destroy_all_pmds(struct dp_netdev *dp, bool non_pmd); /* 销毁所有 PMD */
+static void dp_netdev_pmd_clear_ports(struct dp_netdev_pmd_thread *pmd); /* 清除 PMD 的端口列表 */
 static void dp_netdev_add_port_tx_to_pmd(struct dp_netdev_pmd_thread *pmd,
                                          struct dp_netdev_port *port)
     OVS_REQUIRES(pmd->port_mutex);
@@ -529,13 +797,15 @@ static void dp_netdev_del_bond_tx_from_pmd(struct dp_netdev_pmd_thread *pmd,
                                            uint32_t bond_id)
     OVS_EXCLUDED(pmd->bond_mutex);
 
+/* datapath 重配置及 PMD 引用计数管理 */
 static void reconfigure_datapath(struct dp_netdev *dp)
-    OVS_REQ_RDLOCK(dp->port_rwlock);
-static bool dp_netdev_pmd_try_ref(struct dp_netdev_pmd_thread *pmd);
-static void dp_netdev_pmd_unref(struct dp_netdev_pmd_thread *pmd);
-static void dp_netdev_pmd_flow_flush(struct dp_netdev_pmd_thread *pmd);
+    OVS_REQ_RDLOCK(dp->port_rwlock);  /* 重新配置 datapath（端口/PMD 变更后调用） */
+static bool dp_netdev_pmd_try_ref(struct dp_netdev_pmd_thread *pmd); /* 尝试增加 PMD 引用 */
+static void dp_netdev_pmd_unref(struct dp_netdev_pmd_thread *pmd);   /* 减少 PMD 引用 */
+static void dp_netdev_pmd_flow_flush(struct dp_netdev_pmd_thread *pmd); /* 清空 PMD 的所有流表 */
 static void pmd_load_cached_ports(struct dp_netdev_pmd_thread *pmd)
-    OVS_REQUIRES(pmd->port_mutex);
+    OVS_REQUIRES(pmd->port_mutex); /* 加载端口缓存到 PMD 本地 */
+/* 尝试优化 dpcls 子表排序和 miniflow 提取函数。 */
 static inline void
 dp_netdev_pmd_try_optimize(struct dp_netdev_pmd_thread *pmd,
                            struct polled_queue *poll_list, int poll_cnt);
@@ -567,14 +837,16 @@ static void dp_netdev_request_reconfigure(struct dp_netdev *dp);
 static inline bool
 pmd_perf_metrics_enabled(const struct dp_netdev_pmd_thread *pmd);
 
+/* simple_match 是一种优化路径：对于只匹配 in_port 的简单流表规则，
+ * 可以跳过完整的 dpcls 查找，直接匹配。 */
 static void dp_netdev_simple_match_insert(struct dp_netdev_pmd_thread *pmd,
                                           struct dp_netdev_flow *flow)
-    OVS_REQUIRES(pmd->flow_mutex);
+    OVS_REQUIRES(pmd->flow_mutex);  /* 插入简单匹配流 */
 static void dp_netdev_simple_match_remove(struct dp_netdev_pmd_thread *pmd,
                                           struct dp_netdev_flow *flow)
-    OVS_REQUIRES(pmd->flow_mutex);
+    OVS_REQUIRES(pmd->flow_mutex);  /* 移除简单匹配流 */
 
-static bool dp_netdev_flow_is_simple_match(const struct match *);
+static bool dp_netdev_flow_is_simple_match(const struct match *); /* 判断是否为简单匹配 */
 
 /* Updates the time in PMD threads context and should be called in three cases:
  *
@@ -599,12 +871,15 @@ pmd_thread_ctx_time_update(struct dp_netdev_pmd_thread *pmd)
 }
 
 /* Returns true if 'dpif' is a netdev or dummy dpif, false otherwise. */
+/* 判断给定的 dpif 是否为 netdev 类型（用户空间 datapath）。
+ * 通过比较 open 函数指针来判断。 */
 bool
 dpif_is_netdev(const struct dpif *dpif)
 {
     return dpif->dpif_class->open == dpif_netdev_open;
 }
 
+/* 将通用 dpif 指针向下转型为 dpif_netdev（类似 C++ 的 static_cast）。 */
 static struct dpif_netdev *
 dpif_netdev_cast(const struct dpif *dpif)
 {
@@ -612,20 +887,23 @@ dpif_netdev_cast(const struct dpif *dpif)
     return CONTAINER_OF(dpif, struct dpif_netdev, dpif);
 }
 
+/* 从 dpif 指针获取底层的 dp_netdev 实例。 */
 static struct dp_netdev *
 get_dp_netdev(const struct dpif *dpif)
 {
     return dpif_netdev_cast(dpif)->dp;
 }
 
+/* PMD 信息查询类型枚举（用于 ovs-appctl dpif-netdev/pmd-* 命令）。 */
 enum pmd_info_type {
-    PMD_INFO_SHOW_STATS,  /* Show how cpu cycles are spent. */
-    PMD_INFO_CLEAR_STATS, /* Set the cycles count to 0. */
-    PMD_INFO_SHOW_RXQ,    /* Show poll lists of pmd threads. */
-    PMD_INFO_PERF_SHOW,   /* Show pmd performance details. */
-    PMD_INFO_SLEEP_SHOW,  /* Show max sleep configuration details. */
+    PMD_INFO_SHOW_STATS,  /* Show how cpu cycles are spent. */   /* 显示 CPU 周期统计 */
+    PMD_INFO_CLEAR_STATS, /* Set the cycles count to 0. */       /* 清零统计 */
+    PMD_INFO_SHOW_RXQ,    /* Show poll lists of pmd threads. */  /* 显示 RXQ 分配情况 */
+    PMD_INFO_PERF_SHOW,   /* Show pmd performance details. */    /* 显示详细性能指标 */
+    PMD_INFO_SLEEP_SHOW,  /* Show max sleep configuration details. */ /* 显示休眠配置 */
 };
 
+/* 格式化输出 PMD 线程标识信息（numa_id, core_id）。 */
 static void
 format_pmd_thread(struct ds *reply, struct dp_netdev_pmd_thread *pmd)
 {
@@ -640,6 +918,9 @@ format_pmd_thread(struct ds *reply, struct dp_netdev_pmd_thread *pmd)
     ds_put_cstr(reply, ":\n");
 }
 
+/* 显示 PMD 线程的统计信息（对应 dpif-netdev/pmd-stats-show 命令）。
+ * 输出内容包括：收包数、recirculation 次数、各级缓存命中数、
+ * upcall 成功/失败数、空闲/繁忙 CPU 周期比例等。 */
 static void
 pmd_info_show_stats(struct ds *reply,
                     struct dp_netdev_pmd_thread *pmd)
@@ -722,6 +1003,8 @@ pmd_info_show_stats(struct ds *reply,
                   stats[PMD_CYCLES_ITER_BUSY], total_packets);
 }
 
+/* 显示 PMD 线程的详细性能指标（对应 dpif-netdev/pmd-perf-show 命令）。
+ * 包括：整体统计、直方图分布、迭代历史、毫秒级历史等。 */
 static void
 pmd_info_show_perf(struct ds *reply,
                    struct dp_netdev_pmd_thread *pmd,
@@ -763,6 +1046,7 @@ pmd_info_show_perf(struct ds *reply,
     }
 }
 
+/* 比较函数：按端口名和队列 ID 排序 RXQ 轮询列表。 */
 static int
 compare_poll_list(const void *a_, const void *b_)
 {
@@ -781,6 +1065,7 @@ compare_poll_list(const void *a_, const void *b_)
     }
 }
 
+/* 获取 PMD 线程的 RXQ 轮询列表并按名称排序（用于 show 命令输出）。 */
 static void
 sorted_poll_list(struct dp_netdev_pmd_thread *pmd, struct rxq_poll **list,
                  size_t *n)
@@ -806,6 +1091,8 @@ sorted_poll_list(struct dp_netdev_pmd_thread *pmd, struct rxq_poll **list,
     *list = ret;
 }
 
+/* 显示 PMD 线程的 RXQ 分配和使用率（对应 dpif-netdev/pmd-rxq-show 命令）。
+ * 输出每个 RXQ 的端口名、队列 ID、启用状态、PMD 使用率百分比。 */
 static void
 pmd_info_show_rxq(struct ds *reply, struct dp_netdev_pmd_thread *pmd,
                   int secs)
@@ -887,6 +1174,7 @@ pmd_info_show_rxq(struct ds *reply, struct dp_netdev_pmd_thread *pmd,
     }
 }
 
+/* 比较函数：按 core_id 排序 PMD 线程列表。 */
 static int
 compare_poll_thread_list(const void *a_, const void *b_)
 {
@@ -931,6 +1219,8 @@ sorted_poll_thread_list(struct dp_netdev *dp,
     *n = k;
 }
 
+/* ovs-appctl dpif-netdev/subtable-lookup-info-get 回调：
+ * 显示当前可用的子表查找函数及其优先级。 */
 static void
 dpif_netdev_subtable_lookup_get(struct unixctl_conn *conn, int argc OVS_UNUSED,
                                 const char *argv[] OVS_UNUSED,
@@ -943,6 +1233,8 @@ dpif_netdev_subtable_lookup_get(struct unixctl_conn *conn, int argc OVS_UNUSED,
     ds_destroy(&reply);
 }
 
+/* ovs-appctl dpif-netdev/subtable-lookup-prio-set 回调：
+ * 设置指定子表查找函数的优先级，并重新探测所有 dpcls 实例。 */
 static void
 dpif_netdev_subtable_lookup_set(struct unixctl_conn *conn, int argc OVS_UNUSED,
                                 const char *argv[], void *aux OVS_UNUSED)
@@ -1023,6 +1315,8 @@ dpif_netdev_subtable_lookup_set(struct unixctl_conn *conn, int argc OVS_UNUSED,
     ds_destroy(&reply);
 }
 
+/* ovs-appctl dpif-netdev/dpif-impl-get 回调：
+ * 显示当前各 PMD 线程使用的 DPIF 实现（如 dpif_netdev_input）。 */
 static void
 dpif_netdev_impl_get(struct unixctl_conn *conn, int argc OVS_UNUSED,
                      const char *argv[] OVS_UNUSED, void *aux OVS_UNUSED)
@@ -1047,6 +1341,8 @@ dpif_netdev_impl_get(struct unixctl_conn *conn, int argc OVS_UNUSED,
     ds_destroy(&reply);
 }
 
+/* ovs-appctl dpif-netdev/dpif-impl-set 回调：
+ * 设置 DPIF 实现（如切换到 AVX512 优化的输入处理函数）。 */
 static void
 dpif_netdev_impl_set(struct unixctl_conn *conn, int argc OVS_UNUSED,
                      const char *argv[], void *aux OVS_UNUSED)
@@ -1108,6 +1404,8 @@ dpif_netdev_impl_set(struct unixctl_conn *conn, int argc OVS_UNUSED,
     ds_destroy(&reply);
 }
 
+/* ovs-appctl dpif-netdev/miniflow-parser-get 回调：
+ * 显示各 PMD 线程当前使用的 miniflow 提取实现。 */
 static void
 dpif_miniflow_extract_impl_get(struct unixctl_conn *conn, int argc OVS_UNUSED,
                                const char *argv[] OVS_UNUSED,
@@ -1133,6 +1431,9 @@ dpif_miniflow_extract_impl_get(struct unixctl_conn *conn, int argc OVS_UNUSED,
     ds_destroy(&reply);
 }
 
+/* ovs-appctl dpif-netdev/miniflow-parser-set 回调：
+ * 设置 miniflow 提取实现（如 study 模式自动学习最优实现，
+ * 或手动指定 AVX512 等优化实现）。支持 -pmd 参数指定单个 PMD。 */
 static void
 dpif_miniflow_extract_impl_set(struct unixctl_conn *conn, int argc,
                                const char *argv[], void *aux OVS_UNUSED)
@@ -1322,6 +1623,8 @@ error:
     ds_destroy(&reply);
 }
 
+/* ovs-appctl dpif-netdev/pmd-rxq-rebalance 回调：
+ * 手动触发 RXQ 在 PMD 线程间的重新分配。 */
 static void
 dpif_netdev_pmd_rebalance(struct unixctl_conn *conn, int argc,
                           const char *argv[], void *aux OVS_UNUSED)
@@ -1352,6 +1655,7 @@ dpif_netdev_pmd_rebalance(struct unixctl_conn *conn, int argc,
     ds_destroy(&reply);
 }
 
+/* 格式化输出 PMD 线程的休眠配置信息。 */
 static void
 pmd_info_show_sleep(struct ds *reply, unsigned core_id, int numa_id,
                     uint64_t pmd_max_sleep)
@@ -1365,6 +1669,10 @@ pmd_info_show_sleep(struct ds *reply, unsigned core_id, int numa_id,
                   numa_id, core_id, pmd_max_sleep);
 }
 
+/* PMD 信息统一入口函数（被多个 appctl 命令共用）。
+ * 根据 aux 参数中的 pmd_info_type 分发到不同的处理分支：
+ * stats-show / stats-clear / rxq-show / perf-show / sleep-show。
+ * 支持 -pmd 过滤指定核心、-secs 指定统计时间窗口。 */
 static void
 dpif_netdev_pmd_info(struct unixctl_conn *conn, int argc, const char *argv[],
                      void *aux)
@@ -1465,6 +1773,8 @@ dpif_netdev_pmd_info(struct unixctl_conn *conn, int argc, const char *argv[],
     ds_destroy(&reply);
 }
 
+/* ovs-appctl dpif-netdev/pmd-perf-show 命令解析。
+ * 解析 -nh（不显示直方图）、-it（迭代历史长度）、-ms（毫秒历史长度）参数。 */
 static void
 pmd_perf_show_cmd(struct unixctl_conn *conn, int argc,
                           const char *argv[],
@@ -1507,6 +1817,8 @@ pmd_perf_show_cmd(struct unixctl_conn *conn, int argc,
     dpif_netdev_pmd_info(conn, argc, argv, &par);
 }
 
+/* ovs-appctl dpif-netdev/bond-show 回调：
+ * 显示数据路径中所有 bond 的哈希桶到成员端口的映射关系。 */
 static void
 dpif_netdev_bond_show(struct unixctl_conn *conn, int argc,
                       const char *argv[], void *aux OVS_UNUSED)
@@ -1549,7 +1861,294 @@ dpif_netdev_bond_show(struct unixctl_conn *conn, int argc,
     ds_destroy(&reply);
 }
 
-
+/* @veencn_260223: Latency appctl command callbacks. */
+
+static const char *latency_hist_labels[LATENCY_HIST_BUCKETS] = {
+    "<100ns", "100-200ns", "200-500ns", "500ns-1us",
+    "1-10us", "10-100us", ">=100us"
+};
+
+static void
+latency_stage_format(struct ds *reply, const char *name,
+                     const struct latency_stage_stats *stage)
+{
+    if (stage->count == 0) {
+        ds_put_format(reply, "  %-20s  (no data)\n", name);
+        return;
+    }
+    uint64_t avg_ns = latency_cycles_to_ns(stage->total_cycles / stage->count);
+    uint64_t min_ns = latency_cycles_to_ns(stage->min_cycles);
+    uint64_t max_ns = latency_cycles_to_ns(stage->max_cycles);
+
+    ds_put_format(reply,
+                  "  %-20s  cnt: %10"PRIu64
+                  "  avg: %6"PRIu64" ns"
+                  "  min: %6"PRIu64" ns"
+                  "  max: %6"PRIu64" ns\n",
+                  name, stage->count, avg_ns, min_ns, max_ns);
+}
+
+static void
+latency_hist_format(struct ds *reply, const char *name,
+                    const struct latency_stage_stats *stage)
+{
+    if (stage->count == 0) {
+        return;
+    }
+    ds_put_format(reply, "  %s:\n", name);
+    for (int b = 0; b < LATENCY_HIST_BUCKETS; b++) {
+        if (stage->histogram[b] == 0) {
+            continue;
+        }
+        double pct = 100.0 * stage->histogram[b] / stage->count;
+        int bar_len = (int)(pct / 2.0);
+        if (bar_len > 50) {
+            bar_len = 50;
+        }
+        char bar[52];
+        memset(bar, '#', bar_len);
+        bar[bar_len] = '\0';
+        ds_put_format(reply, "    %-12s %10"PRIu64" (%5.1f%%) %s\n",
+                      latency_hist_labels[b],
+                      stage->histogram[b], pct, bar);
+    }
+}
+
+/* Helper: find the single datapath. */
+static struct dp_netdev *
+latency_get_dp(struct unixctl_conn *conn, int *argc, const char **argv[])
+{
+    struct dp_netdev *dp = NULL;
+
+    while (*argc > 1) {
+        if (!strcmp((*argv)[1], "-pmd") && *argc > 2) {
+            *argc -= 2;
+            *argv += 2;
+        } else {
+            dp = shash_find_data(&dp_netdevs, (*argv)[1]);
+            *argc -= 1;
+            *argv += 1;
+        }
+    }
+    if (!dp) {
+        if (shash_count(&dp_netdevs) == 1) {
+            dp = shash_first(&dp_netdevs)->data;
+        } else {
+            unixctl_command_reply_error(conn,
+                "please specify an existing datapath");
+        }
+    }
+    return dp;
+}
+
+static void
+dpif_netdev_latency_show(struct unixctl_conn *conn,
+                         int argc, const char *argv[],
+                         void *aux OVS_UNUSED)
+{
+    struct ds reply = DS_EMPTY_INITIALIZER;
+    unsigned int filter_core = UINT_MAX;
+    size_t n;
+
+    /* Parse -pmd core before finding dp. */
+    for (int a = 1; a + 1 < argc; a++) {
+        if (!strcmp(argv[a], "-pmd")) {
+            str_to_uint(argv[a + 1], 10, &filter_core);
+            break;
+        }
+    }
+
+    ovs_mutex_lock(&dp_netdev_mutex);
+    struct dp_netdev *dp = latency_get_dp(conn, &argc, &argv);
+    if (!dp) {
+        ovs_mutex_unlock(&dp_netdev_mutex);
+        return;
+    }
+
+    struct dp_netdev_pmd_thread **pmd_list;
+    sorted_poll_thread_list(dp, &pmd_list, &n);
+    for (size_t i = 0; i < n; i++) {
+        struct dp_netdev_pmd_thread *pmd = pmd_list[i];
+        if (!pmd) {
+            break;
+        }
+        if (pmd->core_id == NON_PMD_CORE_ID) {
+            continue;
+        }
+        if (filter_core != UINT_MAX && pmd->core_id != filter_core) {
+            continue;
+        }
+
+        struct pmd_latency_stats *ls = &pmd->latency_stats;
+        ds_put_format(&reply,
+            "pmd thread numa_id %d core_id %u (latency: %s):\n",
+            pmd->numa_id, pmd->core_id,
+            ls->enabled ? "enabled" : "disabled");
+
+        if (!ls->enabled && ls->total.count == 0) {
+            ds_put_format(&reply, "  (no data collected)\n\n");
+            continue;
+        }
+
+        ds_put_format(&reply,
+            "  Hits: EMC=%"PRIu64" SMC=%"PRIu64
+            " dpcls=%"PRIu64" upcall=%"PRIu64"\n",
+            ls->emc_hit_count, ls->smc_hit_count,
+            ls->dpcls_hit_count, ls->upcall_count);
+        ds_put_format(&reply,
+            "  %-20s  %10s  %10s  %10s  %10s\n",
+            "Stage", "count", "avg(ns)", "min(ns)", "max(ns)");
+        ds_put_format(&reply,
+            "  %-20s  %10s  %10s  %10s  %10s\n",
+            "--------------------", "----------",
+            "----------", "----------", "----------");
+        latency_stage_format(&reply, "miniflow extract", &ls->miniflow);
+        latency_stage_format(&reply, "EMC lookup", &ls->emc_lookup);
+        latency_stage_format(&reply, "SMC lookup", &ls->smc_lookup);
+        latency_stage_format(&reply, "dpcls lookup", &ls->dpcls_lookup);
+        latency_stage_format(&reply, "upcall", &ls->upcall);
+        latency_stage_format(&reply, "action exec", &ls->action_exec);
+        ds_put_format(&reply,
+            "  %-20s  %10s  %10s  %10s  %10s\n",
+            "--------------------", "----------",
+            "----------", "----------", "----------");
+        latency_stage_format(&reply, "TOTAL", &ls->total);
+        ds_put_cstr(&reply, "\n");
+    }
+    free(pmd_list);
+    ovs_mutex_unlock(&dp_netdev_mutex);
+    unixctl_command_reply(conn, ds_cstr(&reply));
+    ds_destroy(&reply);
+}
+
+static void
+dpif_netdev_latency_hist(struct unixctl_conn *conn,
+                         int argc, const char *argv[],
+                         void *aux OVS_UNUSED)
+{
+    struct ds reply = DS_EMPTY_INITIALIZER;
+    unsigned int filter_core = UINT_MAX;
+    size_t n;
+
+    for (int a = 1; a + 1 < argc; a++) {
+        if (!strcmp(argv[a], "-pmd")) {
+            str_to_uint(argv[a + 1], 10, &filter_core);
+            break;
+        }
+    }
+
+    ovs_mutex_lock(&dp_netdev_mutex);
+    struct dp_netdev *dp = latency_get_dp(conn, &argc, &argv);
+    if (!dp) {
+        ovs_mutex_unlock(&dp_netdev_mutex);
+        return;
+    }
+
+    struct dp_netdev_pmd_thread **pmd_list;
+    sorted_poll_thread_list(dp, &pmd_list, &n);
+    for (size_t i = 0; i < n; i++) {
+        struct dp_netdev_pmd_thread *pmd = pmd_list[i];
+        if (!pmd) {
+            break;
+        }
+        if (pmd->core_id == NON_PMD_CORE_ID) {
+            continue;
+        }
+        if (filter_core != UINT_MAX && pmd->core_id != filter_core) {
+            continue;
+        }
+
+        struct pmd_latency_stats *ls = &pmd->latency_stats;
+        ds_put_format(&reply, "pmd thread numa_id %d core_id %u:\n",
+                      pmd->numa_id, pmd->core_id);
+        /* @veencn_260223: Check if any stage has data. */
+        if (ls->miniflow.count == 0 && ls->emc_lookup.count == 0
+            && ls->smc_lookup.count == 0 && ls->dpcls_lookup.count == 0
+            && ls->upcall.count == 0 && ls->action_exec.count == 0) {
+            ds_put_format(&reply, "  (no data)\n\n");
+            continue;
+        }
+        latency_hist_format(&reply, "miniflow extract", &ls->miniflow);
+        latency_hist_format(&reply, "EMC lookup", &ls->emc_lookup);
+        latency_hist_format(&reply, "SMC lookup", &ls->smc_lookup);
+        latency_hist_format(&reply, "dpcls lookup", &ls->dpcls_lookup);
+        latency_hist_format(&reply, "upcall", &ls->upcall);
+        latency_hist_format(&reply, "action exec", &ls->action_exec);
+        latency_hist_format(&reply, "TOTAL", &ls->total);
+        ds_put_cstr(&reply, "\n");
+    }
+    free(pmd_list);
+    ovs_mutex_unlock(&dp_netdev_mutex);
+    unixctl_command_reply(conn, ds_cstr(&reply));
+    ds_destroy(&reply);
+}
+
+static void
+dpif_netdev_latency_clear(struct unixctl_conn *conn,
+                          int argc OVS_UNUSED,
+                          const char *argv[] OVS_UNUSED,
+                          void *aux OVS_UNUSED)
+{
+    ovs_mutex_lock(&dp_netdev_mutex);
+    struct shash_node *node;
+    SHASH_FOR_EACH (node, &dp_netdevs) {
+        struct dp_netdev *dp = node->data;
+        struct dp_netdev_pmd_thread *pmd;
+        CMAP_FOR_EACH (pmd, node, &dp->poll_threads) {
+            latency_stats_clear(&pmd->latency_stats);
+        }
+    }
+    ovs_mutex_unlock(&dp_netdev_mutex);
+    unixctl_command_reply(conn, "latency stats cleared\n");
+}
+
+static void
+dpif_netdev_latency_set(struct unixctl_conn *conn,
+                        int argc OVS_UNUSED,
+                        const char *argv[],
+                        void *aux OVS_UNUSED)
+{
+    bool enable;
+    if (!strcmp(argv[1], "enabled")) {
+        enable = true;
+    } else if (!strcmp(argv[1], "disabled")) {
+        enable = false;
+    } else {
+        unixctl_command_reply_error(conn,
+            "usage: dpif-netdev/latency-set enabled|disabled");
+        return;
+    }
+
+    ovs_mutex_lock(&dp_netdev_mutex);
+    struct shash_node *node;
+    SHASH_FOR_EACH (node, &dp_netdevs) {
+        struct dp_netdev *dp = node->data;
+        struct dp_netdev_pmd_thread *pmd;
+        CMAP_FOR_EACH (pmd, node, &dp->poll_threads) {
+            if (enable && !pmd->latency_stats.enabled) {
+                latency_stats_clear(&pmd->latency_stats);
+            }
+            pmd->latency_stats.enabled = enable;
+        }
+    }
+    ovs_mutex_unlock(&dp_netdev_mutex);
+    unixctl_command_reply(conn, enable
+        ? "latency measurement enabled (stats cleared)\n"
+        : "latency measurement disabled\n");
+}
+/* @veencn_260223 end: latency appctl callbacks */
+
+/* dpif_netdev_init — 模块初始化函数。
+ * 注册所有 ovs-appctl 控制命令，包括：
+ * - pmd-stats-show/clear：PMD 统计查看/清零
+ * - pmd-rxq-show：RXQ 分配和使用率
+ * - pmd-perf-show：PMD 详细性能指标
+ * - pmd-rxq-rebalance：手动触发 RXQ 重分配
+ * - subtable-lookup-*：子表查找函数管理
+ * - dpif-impl-*：DPIF 实现切换
+ * - miniflow-parser-*：miniflow 提取函数管理
+ * - latency-*：延迟测量命令
+ * 在 OVS 启动时由 dpif 框架调用一次。 */
 static int
 dpif_netdev_init(void)
 {
@@ -1613,9 +2212,21 @@ dpif_netdev_init(void)
     unixctl_command_register("dpif-netdev/miniflow-parser-get", "",
                              0, 0, dpif_miniflow_extract_impl_get,
                              NULL);
+
+    /* @veencn_260223: Register latency measurement commands. */
+    unixctl_command_register("dpif-netdev/latency-show", "[-pmd core]",
+                             0, 2, dpif_netdev_latency_show, NULL);
+    unixctl_command_register("dpif-netdev/latency-hist", "[-pmd core]",
+                             0, 2, dpif_netdev_latency_hist, NULL);
+    unixctl_command_register("dpif-netdev/latency-clear", "",
+                             0, 0, dpif_netdev_latency_clear, NULL);
+    unixctl_command_register("dpif-netdev/latency-set", "enabled|disabled",
+                             1, 1, dpif_netdev_latency_set, NULL);
+
     return 0;
 }
 
+/* 枚举所有属于给定 dpif_class 的 datapath 名称。 */
 static int
 dpif_netdev_enumerate(struct sset *all_dps,
                       const struct dpif_class *dpif_class)
@@ -1637,12 +2248,15 @@ dpif_netdev_enumerate(struct sset *all_dps,
     return 0;
 }
 
+/* 判断 dpif class 是否为 dummy（测试用）类型。 */
 static bool
 dpif_netdev_class_is_dummy(const struct dpif_class *class)
 {
     return class != &dpif_netdev_class;
 }
 
+/* 将端口类型转换为底层实际类型。
+ * "internal" 在真实 datapath 中映射为 "tap"，在 dummy 中映射为 "dummy-internal"。 */
 static const char *
 dpif_netdev_port_open_type(const struct dpif_class *class, const char *type)
 {
@@ -1651,6 +2265,8 @@ dpif_netdev_port_open_type(const struct dpif_class *class, const char *type)
                   : "tap";
 }
 
+/* 创建 dpif_netdev 接口实例并初始化。
+ * 增加 dp 的引用计数，返回通用 dpif 指针供上层使用。 */
 static struct dpif *
 create_dpif_netdev(struct dp_netdev *dp)
 {
@@ -1709,6 +2325,8 @@ choose_port(struct dp_netdev *dp, const char *name)
     return ODPP_NONE;
 }
 
+/* 计算 meter ID 的哈希值。直接使用 meter_id 作为哈希值，
+ * 因为 ofproto-dpif 层的 id-pool 保证了连续分配。 */
 static uint32_t
 dp_meter_hash(uint32_t meter_id)
 {
@@ -1719,6 +2337,7 @@ dp_meter_hash(uint32_t meter_id)
     return meter_id;
 }
 
+/* 销毁 datapath 的所有 meter 资源。 */
 static void
 dp_netdev_meter_destroy(struct dp_netdev *dp)
 {
@@ -1735,6 +2354,7 @@ dp_netdev_meter_destroy(struct dp_netdev *dp)
     ovs_mutex_destroy(&dp->meters_lock);
 }
 
+/* 按 meter_id 在 cmap 中查找 meter。 */
 static struct dp_meter *
 dp_meter_lookup(struct cmap *meters, uint32_t meter_id)
 {
@@ -1750,6 +2370,7 @@ dp_meter_lookup(struct cmap *meters, uint32_t meter_id)
     return NULL;
 }
 
+/* 从 cmap 中移除指定 meter 并通过 RCU 延迟释放。 */
 static void
 dp_meter_detach_free(struct cmap *meters, uint32_t meter_id)
 {
@@ -1761,12 +2382,17 @@ dp_meter_detach_free(struct cmap *meters, uint32_t meter_id)
     }
 }
 
+/* 将 meter 插入 cmap。 */
 static void
 dp_meter_attach(struct cmap *meters, struct dp_meter *meter)
 {
     cmap_insert(meters, &meter->node, dp_meter_hash(meter->id));
 }
 
+/* 创建并初始化一个新的 dp_netdev 数据路径实例。
+ * 初始化所有子系统：端口哈希表、meter、conntrack、PMD 线程池、
+ * TX 队列 ID 池、non-PMD 线程等。并添加一个 internal 类型的本地端口。
+ * 首次调用时还会校准 TSC 频率（用于性能计数）。 */
 static int
 create_dp_netdev(const char *name, const struct dpif_class *class,
                  struct dp_netdev **dpp)
@@ -1858,12 +2484,16 @@ dp_netdev_request_reconfigure(struct dp_netdev *dp)
     seq_change(dp->reconfigure_seq);
 }
 
+/* 检查 datapath 是否需要重新配置（端口/PMD 变更后需重配）。 */
 static bool
 dp_netdev_is_reconf_required(struct dp_netdev *dp)
 {
     return seq_read(dp->reconfigure_seq) != dp->last_reconfigure_seq;
 }
 
+/* 打开或创建一个 netdev datapath。
+ * create=true 时创建新的 datapath，否则打开已有的。
+ * 返回 dpif 接口指针供上层使用。 */
 static int
 dpif_netdev_open(const struct dpif_class *class, const char *name,
                  bool create, struct dpif **dpifp)
@@ -1888,6 +2518,7 @@ dpif_netdev_open(const struct dpif_class *class, const char *name,
     return error;
 }
 
+/* 销毁 upcall 读写锁（在释放 datapath 前调用）。 */
 static void
 dp_netdev_destroy_upcall_lock(struct dp_netdev *dp)
     OVS_NO_THREAD_SAFETY_ANALYSIS
@@ -1900,6 +2531,7 @@ dp_netdev_destroy_upcall_lock(struct dp_netdev *dp)
     fat_rwlock_destroy(&dp->upcall_rwlock);
 }
 
+/* 计算 bond_id 的哈希值。 */
 static uint32_t
 hash_bond_id(uint32_t bond_id)
 {
@@ -1908,6 +2540,8 @@ hash_bond_id(uint32_t bond_id)
 
 /* Requires dp_netdev_mutex so that we can't get a new reference to 'dp'
  * through the 'dp_netdevs' shash while freeing 'dp'. */
+/* 释放 dp_netdev 及其所有资源：删除所有端口、bond、PMD 线程、
+ * conntrack、meter、TX 队列池等，最终 free(dp)。 */
 static void
 dp_netdev_free(struct dp_netdev *dp)
     OVS_REQUIRES(dp_netdev_mutex)
@@ -1963,6 +2597,7 @@ dp_netdev_free(struct dp_netdev *dp)
     free(dp);
 }
 
+/* 减少 dp 的引用计数，降为零时释放 dp。 */
 static void
 dp_netdev_unref(struct dp_netdev *dp)
 {
@@ -1977,6 +2612,7 @@ dp_netdev_unref(struct dp_netdev *dp)
     }
 }
 
+/* 关闭 dpif 接口：减少 dp 引用计数，释放 dpif 结构。 */
 static void
 dpif_netdev_close(struct dpif *dpif)
 {
@@ -1986,6 +2622,7 @@ dpif_netdev_close(struct dpif *dpif)
     free(dpif);
 }
 
+/* 销毁 datapath（标记已销毁并释放引用）。 */
 static int
 dpif_netdev_destroy(struct dpif *dpif)
 {
@@ -2016,6 +2653,8 @@ non_atomic_ullong_add(atomic_ullong *var, unsigned long long n)
     atomic_store_relaxed(var, tmp);
 }
 
+/* 获取 datapath 统计信息：遍历所有 PMD 线程，
+ * 汇总流表数、命中数（各级缓存之和）、miss 数、丢包数。 */
 static int
 dpif_netdev_get_stats(const struct dpif *dpif, struct dpif_dp_stats *stats)
 {
@@ -2042,6 +2681,9 @@ dpif_netdev_get_stats(const struct dpif *dpif, struct dpif_dp_stats *stats)
     return 0;
 }
 
+/* 触发 PMD 线程重新加载配置。
+ * non-PMD 线程直接在当前上下文中重新加载端口缓存；
+ * PMD 线程则通过 reload_seq 通知，等待其在主循环中完成重载。 */
 static void
 dp_netdev_reload_pmd__(struct dp_netdev_pmd_thread *pmd)
 {
@@ -2058,12 +2700,14 @@ dp_netdev_reload_pmd__(struct dp_netdev_pmd_thread *pmd)
     atomic_store_explicit(&pmd->reload, true, memory_order_release);
 }
 
+/* 计算端口号的哈希值（用于端口哈希表查找）。 */
 static uint32_t
 hash_port_no(odp_port_t port_no)
 {
     return hash_int(odp_to_u32(port_no), 0);
 }
 
+/* 创建端口：打开 netdev 设备、验证（拒绝 loopback）、分配并初始化 dp_netdev_port。 */
 static int
 port_create(const char *devname, const char *type,
             odp_port_t port_no, struct dp_netdev_port **portp)
@@ -2107,6 +2751,8 @@ out:
     return error;
 }
 
+/* 向 datapath 添加端口：创建端口、插入端口哈希表、
+ * 触发 datapath 重配置（分配 RXQ 到 PMD）、设置混杂模式。 */
 static int
 do_add_port(struct dp_netdev *dp, const char *devname, const char *type,
             odp_port_t port_no)
@@ -2152,6 +2798,7 @@ do_add_port(struct dp_netdev *dp, const char *devname, const char *type,
     return 0;
 }
 
+/* dpif 接口：添加端口。选择端口号后调用 do_add_port。 */
 static int
 dpif_netdev_port_add(struct dpif *dpif, struct netdev *netdev,
                      odp_port_t *port_nop)
@@ -2180,6 +2827,7 @@ dpif_netdev_port_add(struct dpif *dpif, struct netdev *netdev,
     return error;
 }
 
+/* dpif 接口：删除端口（不允许删除 LOCAL 端口）。 */
 static int
 dpif_netdev_port_del(struct dpif *dpif, odp_port_t port_no)
 {
@@ -2208,6 +2856,7 @@ is_valid_port_number(odp_port_t port_no)
     return port_no != ODPP_NONE;
 }
 
+/* 在端口哈希表中按端口号查找。 */
 static struct dp_netdev_port *
 dp_netdev_lookup_port(const struct dp_netdev *dp, odp_port_t port_no)
     OVS_REQ_RDLOCK(dp->port_rwlock)
@@ -2236,6 +2885,7 @@ get_port_by_number(struct dp_netdev *dp,
     }
 }
 
+/* 销毁端口：关闭 netdev、恢复标志、关闭所有 RXQ、释放内存。 */
 static void
 port_destroy(struct dp_netdev_port *port)
 {
@@ -2277,6 +2927,7 @@ get_port_by_name(struct dp_netdev *dp,
 }
 
 /* Returns 'true' if there is a port with pmd netdev. */
+/* 检查是否有需要 PMD 轮询的端口（如 DPDK 端口）。 */
 static bool
 has_pmd_port(struct dp_netdev *dp)
     OVS_REQ_RDLOCK(dp->port_rwlock)
@@ -2292,6 +2943,7 @@ has_pmd_port(struct dp_netdev *dp)
     return false;
 }
 
+/* 从 datapath 删除端口：从哈希表移除、触发重配置、销毁端口。 */
 static void
 do_del_port(struct dp_netdev *dp, struct dp_netdev_port *port)
     OVS_REQ_WRLOCK(dp->port_rwlock)
@@ -2303,6 +2955,7 @@ do_del_port(struct dp_netdev *dp, struct dp_netdev_port *port)
     port_destroy(port);
 }
 
+/* 将内部端口信息填充到 dpif_port 结构（用于端口查询响应）。 */
 static void
 answer_port_query(const struct dp_netdev_port *port,
                   struct dpif_port *dpif_port)
@@ -2312,6 +2965,7 @@ answer_port_query(const struct dp_netdev_port *port,
     dpif_port->port_no = port->port_no;
 }
 
+/* dpif 接口：按端口号查询端口信息。 */
 static int
 dpif_netdev_port_query_by_number(const struct dpif *dpif, odp_port_t port_no,
                                  struct dpif_port *dpif_port)
@@ -2330,6 +2984,7 @@ dpif_netdev_port_query_by_number(const struct dpif *dpif, odp_port_t port_no,
     return error;
 }
 
+/* dpif 接口：按设备名查询端口信息。 */
 static int
 dpif_netdev_port_query_by_name(const struct dpif *dpif, const char *devname,
                                struct dpif_port *dpif_port)
@@ -2348,6 +3003,7 @@ dpif_netdev_port_query_by_name(const struct dpif *dpif, const char *devname,
     return error;
 }
 
+/* 释放流表项：释放其 action 和额外信息，然后 free 流本身。 */
 static void
 dp_netdev_flow_free(struct dp_netdev_flow *flow)
 {
@@ -2356,6 +3012,7 @@ dp_netdev_flow_free(struct dp_netdev_flow *flow)
     free(flow);
 }
 
+/* 减少流表项引用计数，降为零时通过 RCU 延迟释放。 */
 void dp_netdev_flow_unref(struct dp_netdev_flow *flow)
 {
     if (ovs_refcount_unref_relaxed(&flow->ref_cnt) == 1) {
@@ -2363,6 +3020,7 @@ void dp_netdev_flow_unref(struct dp_netdev_flow *flow)
     }
 }
 
+/* 按入端口号查找 PMD 线程的 dpcls 分类器实例（无锁查找）。 */
 inline struct dpcls *
 dp_netdev_pmd_lookup_dpcls(struct dp_netdev_pmd_thread *pmd,
                            odp_port_t in_port)
@@ -2378,6 +3036,7 @@ dp_netdev_pmd_lookup_dpcls(struct dp_netdev_pmd_thread *pmd,
     return NULL;
 }
 
+/* 查找或创建指定入端口的 dpcls 分类器（不存在时自动创建）。 */
 static inline struct dpcls *
 dp_netdev_pmd_find_dpcls(struct dp_netdev_pmd_thread *pmd,
                          odp_port_t in_port)
@@ -2398,6 +3057,7 @@ dp_netdev_pmd_find_dpcls(struct dp_netdev_pmd_thread *pmd,
     return cls;
 }
 
+/* 记录流表变更日志（flow_add 或 flow_mod），包括 ufid、匹配字段、新旧 action。 */
 static void
 log_netdev_flow_change(const struct dp_netdev_flow *flow,
                        const struct match *match,
@@ -2463,6 +3123,14 @@ log_netdev_flow_change(const struct dp_netdev_flow *flow,
     ds_destroy(&ds);
 }
 
+/* =====================================================
+ * 流卸载（Flow Offload）管理函数。
+ *
+ * 流卸载允许将流表规则下发到硬件（如智能网卡），由硬件直接转发报文。
+ * 由于卸载操作是异步的，需要用队列深度计数器跟踪待处理的卸载操作数量，
+ * 确保在流销毁时所有操作都已完成。
+ * ===================================================== */
+
 /* Offloaded flows can be handled asynchronously, so we do not always know
  * whether a specific flow is offloaded or not.  It might still be pending;
  * in fact, multiple modifications can be pending, and the actual offload
@@ -2472,6 +3140,7 @@ log_netdev_flow_change(const struct dp_netdev_flow *flow,
  * destroyed (and therefore requires cleanup), we must ensure that all
  * operations have completed.  To achieve this, we track the number of
  * outstanding offloaded flow modifications. */
+/* 原子递增卸载队列深度。若已为负（正在清理），则拒绝入队返回 false。 */
 static bool
 offload_queue_inc(struct dp_netdev_flow *flow)
 {
@@ -2494,6 +3163,7 @@ offload_queue_inc(struct dp_netdev_flow *flow)
     }
 }
 
+/* 原子递减卸载队列深度。返回 true 表示队列可能已空（深度从1降到0）。 */
 static bool
 offload_queue_dec(struct dp_netdev_flow *flow)
 {
@@ -2509,6 +3179,8 @@ offload_queue_dec(struct dp_netdev_flow *flow)
     return false;
 }
 
+/* 尝试标记卸载队列为"已完成"：用 CAS 将深度从0设为-1，
+ * 阻止后续操作入队。成功返回 true。 */
 static bool
 offload_queue_complete(struct dp_netdev_flow *flow)
 {
@@ -2523,6 +3195,7 @@ offload_queue_complete(struct dp_netdev_flow *flow)
                                           &expected_val, -1);
 }
 
+/* 卸载流引用释放回调：清除 offloaded 标记并减引用。 */
 static void
 offload_flow_reference_unreference_cb(unsigned pmd_id OVS_UNUSED,
                                       void *flow_reference_)
@@ -2535,6 +3208,9 @@ offload_flow_reference_unreference_cb(unsigned pmd_id OVS_UNUSED,
     }
 }
 
+/* 卸载流删除完成后的后续处理：
+ * EINPROGRESS 表示异步进行中（什么都不做）；
+ * 其他错误记日志；成功则释放硬件引用。 */
 static void
 offload_flow_del_resume(struct dp_netdev_flow *flow_reference,
                         int error)
@@ -2559,6 +3235,7 @@ offload_flow_del_resume(struct dp_netdev_flow *flow_reference,
     dp_netdev_flow_unref(flow_reference);
 }
 
+/* 异步卸载删除操作完成后的回调入口。 */
 static void
 offload_flow_del_resume_cb(void *aux OVS_UNUSED,
                            struct dpif_flow_stats *stats OVS_UNUSED,
@@ -2569,6 +3246,8 @@ offload_flow_del_resume_cb(void *aux OVS_UNUSED,
     offload_flow_del_resume(flow_reference, error);
 }
 
+/* 请求硬件删除已卸载的流。仅在流被标记为 dead 后调用。
+ * 先检查卸载队列是否已完成，再判断 flow->offloaded 标志。 */
 static void
 offload_flow_del(struct dp_netdev *dp, unsigned pmd_id,
                  struct dp_netdev_flow *flow)
@@ -2609,6 +3288,13 @@ offload_flow_del(struct dp_netdev *dp, unsigned pmd_id,
     offload_flow_del_resume(flow, error);
 }
 
+/* 从 PMD 线程中移除一条流：
+ * 1) 从 dpcls 分类器中删除规则
+ * 2) 清除 simple_match 优化
+ * 3) 从 flow_table cmap 中移除
+ * 4) 递减该入端口的流计数
+ * 5) 标记 dead 并触发硬件卸载删除
+ * 6) 减引用（可能触发 RCU 延迟释放） */
 static void
 dp_netdev_pmd_remove_flow(struct dp_netdev_pmd_thread *pmd,
                           struct dp_netdev_flow *flow)
@@ -2630,6 +3316,7 @@ dp_netdev_pmd_remove_flow(struct dp_netdev_pmd_thread *pmd,
     dp_netdev_flow_unref(flow);
 }
 
+/* 清空 PMD 线程的所有流表项。 */
 static void
 dp_netdev_pmd_flow_flush(struct dp_netdev_pmd_thread *pmd)
 {
@@ -2642,6 +3329,7 @@ dp_netdev_pmd_flow_flush(struct dp_netdev_pmd_thread *pmd)
     ovs_mutex_unlock(&pmd->flow_mutex);
 }
 
+/* dpif 接口的 flow_flush 实现：清空所有 PMD 线程的全部流表。 */
 static int
 dpif_netdev_flow_flush(struct dpif *dpif)
 {
@@ -2655,11 +3343,13 @@ dpif_netdev_flow_flush(struct dpif *dpif)
     return 0;
 }
 
+/* 端口遍历状态，用于 dpif_netdev_port_dump_* 系列函数。 */
 struct dp_netdev_port_state {
     struct hmap_position position;
     char *name;
 };
 
+/* 端口遍历接口：start 分配状态，next 逐个返回端口信息，done 释放资源。 */
 static int
 dpif_netdev_port_dump_start(const struct dpif *dpif OVS_UNUSED, void **statep)
 {
@@ -2707,6 +3397,7 @@ dpif_netdev_port_dump_done(const struct dpif *dpif OVS_UNUSED, void *state_)
     return 0;
 }
 
+/* 检测端口是否有变化（通过 seq 序列号比较）。有变化返回 ENOBUFS，无变化返回 EAGAIN。 */
 static int
 dpif_netdev_port_poll(const struct dpif *dpif_, char **devnamep OVS_UNUSED)
 {
@@ -2725,6 +3416,7 @@ dpif_netdev_port_poll(const struct dpif *dpif_, char **devnamep OVS_UNUSED)
     return error;
 }
 
+/* 等待端口变化事件（poll_block 时使用）。 */
 static void
 dpif_netdev_port_poll_wait(const struct dpif *dpif_)
 {
@@ -2733,12 +3425,14 @@ dpif_netdev_port_poll_wait(const struct dpif *dpif_)
     seq_wait(dpif->dp->port_seq, dpif->last_port_seq);
 }
 
+/* 从 dpcls_rule 指针反推得到包含它的 dp_netdev_flow 结构。 */
 static struct dp_netdev_flow *
 dp_netdev_flow_cast(const struct dpcls_rule *cr)
 {
     return cr ? CONTAINER_OF(cr, struct dp_netdev_flow, cr) : NULL;
 }
 
+/* 尝试增加流的引用计数（RCU 安全版本）。 */
 static bool dp_netdev_flow_ref(struct dp_netdev_flow *flow)
 {
     return ovs_refcount_try_ref_rcu(&flow->ref_cnt);
@@ -2755,6 +3449,17 @@ static bool dp_netdev_flow_ref(struct dp_netdev_flow *flow)
  *   Therefore we can be faster by comparing the map and the miniflow in a
  *   single memcmp().
  * - These functions can be inlined by the compiler. */
+/* =====================================================
+ * netdev_flow_key 工具函数。
+ *
+ * netdev_flow_key 是 miniflow 的封装，额外包含 hash 和 len。
+ * 这些函数（equal, clone, init_masked, init）用于流表查找和匹配：
+ * - equal: hash + memcmp 快速比较
+ * - clone: 仅复制有效数据（由 len 决定）
+ * - mask_init: 从 match 构建 mask key
+ * - init_masked: 用 mask 过滤 flow 生成带掩码的 key
+ * - init: 从完整 flow 构建 key
+ * ===================================================== */
 
 static inline bool
 netdev_flow_key_equal(const struct netdev_flow_key *a,
@@ -2851,6 +3556,15 @@ netdev_flow_key_init(struct netdev_flow_key *key,
     key->len = netdev_flow_key_size(n);
 }
 
+/* =====================================================
+ * EMC（Exact Match Cache）精确匹配缓存。
+ *
+ * EMC 是流表查找的第一级缓存，直接用报文的 miniflow key 进行精确匹配。
+ * 使用开放寻址哈希表，每个哈希桶有多个候选位置。
+ * 命中率最高，但容量有限，适合高频流量。
+ * ===================================================== */
+
+/* 更新 EMC 条目：替换关联的 flow 指针和/或 key。 */
 static inline void
 emc_change_entry(struct emc_entry *ce, struct dp_netdev_flow *flow,
                  const struct netdev_flow_key *key)
@@ -2871,6 +3585,9 @@ emc_change_entry(struct emc_entry *ce, struct dp_netdev_flow *flow,
     }
 }
 
+/* 向 EMC 插入条目：
+ * 1) 先查找是否已有相同 key 的条目（命中则更新 flow）
+ * 2) 否则选择替换目标：优先空条目，其次 hash 最小的条目 */
 static inline void
 emc_insert(struct emc_cache *cache, const struct netdev_flow_key *key,
            struct dp_netdev_flow *flow)
@@ -2900,6 +3617,7 @@ emc_insert(struct emc_cache *cache, const struct netdev_flow_key *key,
     emc_change_entry(to_be_replaced, flow, key);
 }
 
+/* 概率性 EMC 插入：以 1/100 的概率将流插入 EMC，避免低频流污染缓存。 */
 static inline void
 emc_probabilistic_insert(struct dp_netdev_pmd_thread *pmd,
                          const struct netdev_flow_key *key,
@@ -2916,6 +3634,15 @@ emc_probabilistic_insert(struct dp_netdev_pmd_thread *pmd,
     }
 }
 
+/* =====================================================
+ * SMC（Signature Match Cache）签名匹配缓存。
+ *
+ * SMC 是第二级缓存，用 16 位签名（hash >> 16）快速筛选。
+ * 命中后还需从 flow_table 中取出 flow 并验证。
+ * 容量比 EMC 大但查找开销略高。
+ * ===================================================== */
+
+/* 通过 hash 在 SMC 中查找：匹配签名后返回 flow_table 中的 cmap_node。 */
 static inline const struct cmap_node *
 smc_entry_get(struct dp_netdev_pmd_thread *pmd, const uint32_t hash)
 {
@@ -2942,6 +3669,10 @@ smc_entry_get(struct dp_netdev_pmd_thread *pmd, const uint32_t hash)
  * updated. If there is no existing entry, but an empty entry is available,
  * the empty entry will be taken. If no empty entry or existing same signature,
  * a random entry from the hashed bucket will be picked. */
+/* SMC 插入策略：
+ * 1) 已有相同签名 → 更新索引
+ * 2) 有空槽位 → 占用空槽
+ * 3) 都满了 → 随机替换一个 */
 static inline void
 smc_insert(struct dp_netdev_pmd_thread *pmd,
            const struct netdev_flow_key *key,
@@ -2988,6 +3719,7 @@ smc_insert(struct dp_netdev_pmd_thread *pmd,
     bucket->flow_idx[i] = index;
 }
 
+/* 批量概率性 EMC 插入：对位图中标记的每个报文执行概率性插入。 */
 inline void
 emc_probabilistic_insert_batch(struct dp_netdev_pmd_thread *pmd,
                                const struct netdev_flow_key *keys,
@@ -3004,6 +3736,7 @@ emc_probabilistic_insert_batch(struct dp_netdev_pmd_thread *pmd,
     }
 }
 
+/* 批量 SMC 插入：对位图中标记的每个报文将其 flow 索引插入 SMC。 */
 inline void
 smc_insert_batch(struct dp_netdev_pmd_thread *pmd,
                  const struct netdev_flow_key *keys,
@@ -3021,6 +3754,8 @@ smc_insert_batch(struct dp_netdev_pmd_thread *pmd,
     }
 }
 
+/* 在 PMD 的 dpcls 中查找单条流（用于 flow_put/flow_get 等管理操作）。
+ * 根据 key 中的 in_port 找到对应分类器，再执行 dpcls_lookup。 */
 static struct dp_netdev_flow *
 dp_netdev_pmd_lookup_flow(struct dp_netdev_pmd_thread *pmd,
                           const struct netdev_flow_key *key,
@@ -3040,6 +3775,8 @@ dp_netdev_pmd_lookup_flow(struct dp_netdev_pmd_thread *pmd,
     return netdev_flow;
 }
 
+/* 按 UFID 在 flow_table 中查找流。若未提供 UFID 则从 key 计算。
+ * 用于 flow_get/flow_del 等需要精确定位已安装流的场景。 */
 static struct dp_netdev_flow *
 dp_netdev_pmd_find_flow(const struct dp_netdev_pmd_thread *pmd,
                         const ovs_u128 *ufidp, const struct nlattr *key,
@@ -3068,6 +3805,7 @@ dp_netdev_pmd_find_flow(const struct dp_netdev_pmd_thread *pmd,
     return NULL;
 }
 
+/* 获取流的统计信息（包/字节/使用时间/TCP标志），并合并硬件卸载的统计。 */
 static void
 get_dpif_flow_status(const struct dp_netdev *dp,
                      const struct dp_netdev_flow *netdev_flow_,
@@ -3114,6 +3852,8 @@ get_dpif_flow_status(const struct dp_netdev *dp,
  * storing the netlink-formatted key/mask. 'key_buf' may be the same as
  * 'mask_buf'. Actions will be returned without copying, by relying on RCU to
  * protect them. */
+/* 将内部流表项转换为 dpif_flow 格式（用于 ovs-dpctl dump-flows 等）。
+ * terse 模式下跳过 key/mask/actions，仅返回 ufid 和统计信息。 */
 static void
 dp_netdev_flow_to_dpif_flow(const struct dp_netdev *dp,
                             const struct dp_netdev_flow *netdev_flow,
@@ -3164,6 +3904,7 @@ dp_netdev_flow_to_dpif_flow(const struct dp_netdev *dp,
     flow->attrs.dp_extra_info = netdev_flow->dp_extra_info;
 }
 
+/* 从 netlink 属性解析流匹配的 mask。失败时记录错误日志（除非 probe 模式）。 */
 static int
 dpif_netdev_mask_from_nlattrs(const struct nlattr *key, uint32_t key_len,
                               const struct nlattr *mask_key,
@@ -3199,6 +3940,7 @@ dpif_netdev_mask_from_nlattrs(const struct nlattr *key, uint32_t key_len,
     return 0;
 }
 
+/* 从 netlink 属性解析流匹配的 key（flow 结构体）。 */
 static int
 dpif_netdev_flow_from_nlattrs(const struct nlattr *key, uint32_t key_len,
                               struct flow *flow, bool probe)
@@ -3231,6 +3973,8 @@ dpif_netdev_flow_from_nlattrs(const struct nlattr *key, uint32_t key_len,
     return 0;
 }
 
+/* dpif 接口的 flow_get 实现：按 UFID 查找流并返回其 key/mask/actions/stats。
+ * 若未指定 pmd_id，则遍历所有 PMD 线程搜索。 */
 static int
 dpif_netdev_flow_get(const struct dpif *dpif, const struct dpif_flow_get *get)
 {
@@ -3282,6 +4026,7 @@ out:
     return error;
 }
 
+/* 计算 mega_ufid：对 flow 应用 mask 后再哈希，用于流卸载去重。 */
 static void
 dp_netdev_get_mega_ufid(const struct match *match, ovs_u128 *mega_ufid)
 {
@@ -3295,6 +4040,20 @@ dp_netdev_get_mega_ufid(const struct match *match, ovs_u128 *mega_ufid)
     odp_flow_key_hash(&masked_flow, sizeof masked_flow, mega_ufid);
 }
 
+/* =====================================================
+ * Simple Match 优化：对仅匹配 in_port + dl_type + nw_frag + vlan_tci
+ * 的简单流提供 O(1) 快速查找，跳过完整的 dpcls 查找流程。
+ *
+ * 将这4个字段编码为64位 mark 值，用独立的 cmap 表存储。
+ * 仅当某入端口的所有流都是 simple_match 类型时才启用。
+ * ===================================================== */
+
+/* 将 in_port/dl_type/nw_frag/vlan_tci 编码为64位 mark 值。
+ *
+ * 编码原理：将 4 个字段紧凑打包到一个 uint64_t 中，
+ * 使得 simple_match 查找只需一次整数比较即可完成匹配。
+ * 高 32 位放 in_port，中间 16 位放 dl_type，低 16 位放 nw_frag + vlan_tci。
+ * BE/LE 布局不同是为了避免字节序转换开销。 */
 uint64_t
 dp_netdev_simple_match_mark(odp_port_t in_port, ovs_be16 dl_type,
                             uint8_t nw_frag, ovs_be16 vlan_tci)
@@ -3325,111 +4084,157 @@ dp_netdev_simple_match_mark(odp_port_t in_port, ovs_be16 dl_type,
      * Layout is different for LE and BE in order to save a couple of
      * network to host translations.
      * */
-    return ((uint64_t) odp_to_u32(in_port) << 32)
-           | ((OVS_FORCE uint32_t) dl_type << 16)
+    return ((uint64_t) odp_to_u32(in_port) << 32)     /* 高 32 位：入端口号 */
+           | ((OVS_FORCE uint32_t) dl_type << 16)      /* 中 16 位：以太网类型 */
 #if WORDS_BIGENDIAN
            | (((uint16_t) nw_frag & FLOW_NW_FRAG_MASK) << VLAN_PCP_SHIFT)
 #else
            | ((nw_frag & FLOW_NW_FRAG_MASK) << (VLAN_PCP_SHIFT - 8))
-#endif
+#endif                                                 /* nw_frag 2 位嵌入低 16 位 */
            | (OVS_FORCE uint16_t) (vlan_tci & htons(VLAN_VID_MASK | VLAN_CFI));
+                                                       /* VLAN VID+CFI 嵌入低 16 位 */
 }
 
+/* 在 simple_match_table 中按 mark 值查找流。
+ *
+ * 查找过程：
+ *   1. 将 4 个字段编码为 64 位 mark
+ *   2. 对 mark 做哈希，定位 cmap 桶
+ *   3. 遍历桶中节点，比较 mark 值（整数比较，极快）
+ *
+ * 与 dpcls 的 miniflow 匹配相比，这里只需一次 uint64_t 比较，
+ * 无需位图遍历和逐字段掩码运算，因此性能更优。
+ * 调用方：dfc_processing() 中的 simple_match 路径。 */
 struct dp_netdev_flow *
 dp_netdev_simple_match_lookup(const struct dp_netdev_pmd_thread *pmd,
                               odp_port_t in_port, ovs_be16 dl_type,
                               uint8_t nw_frag, ovs_be16 vlan_tci)
 {
+    /* 将 4 个匹配字段编码为 64 位 mark 值 */
     uint64_t mark = dp_netdev_simple_match_mark(in_port, dl_type,
                                                 nw_frag, vlan_tci);
-    uint32_t hash = hash_uint64(mark);
+    uint32_t hash = hash_uint64(mark);           /* 对 mark 做哈希，定位 cmap 桶 */
     struct dp_netdev_flow *flow;
     bool found = false;
 
+    /* 遍历哈希桶中的所有流，比较 mark 值 */
     CMAP_FOR_EACH_WITH_HASH (flow, simple_match_node,
                              hash, &pmd->simple_match_table) {
-        if (flow->simple_match_mark == mark) {
+        if (flow->simple_match_mark == mark) {   /* 精确匹配：一次整数比较 */
             found = true;
             break;
         }
     }
-    return found ? flow : NULL;
+    return found ? flow : NULL;                  /* 命中返回流指针，未命中返回 NULL */
 }
 
+/* 检查指定入端口是否启用了 simple_match 优化：
+ * 当该端口的总流数 == simple 流数时启用。
+ *
+ * 原理：只有当某入端口上的所有流都满足 simple_match 条件时，
+ * 才能安全地使用 simple_match 快速路径（否则会漏匹配非 simple 的流）。
+ * n_flows 和 n_simple_flows 都是按入端口索引的 ccmap 计数器。 */
 bool
 dp_netdev_simple_match_enabled(const struct dp_netdev_pmd_thread *pmd,
                                odp_port_t in_port)
 {
+    /* 总流数 == simple 流数 → 该端口所有流都是 simple，可启用优化 */
     return ccmap_find(&pmd->n_flows, odp_to_u32(in_port))
            == ccmap_find(&pmd->n_simple_flows, odp_to_u32(in_port));
 }
 
+/* 将流插入 simple_match_table（需持有 flow_mutex）。
+ *
+ * 在 dp_netdev_flow_add() 中，若新流满足 simple_match 条件，调用此函数。
+ * 步骤：增引用 → 防重复移除 → 编码 mark → 插入 cmap → 递增计数。 */
 static void
 dp_netdev_simple_match_insert(struct dp_netdev_pmd_thread *pmd,
                               struct dp_netdev_flow *dp_flow)
     OVS_REQUIRES(pmd->flow_mutex)
 {
-    odp_port_t in_port = dp_flow->flow.in_port.odp_port;
-    ovs_be16 vlan_tci = dp_flow->flow.vlans[0].tci;
-    ovs_be16 dl_type = dp_flow->flow.dl_type;
-    uint8_t nw_frag = dp_flow->flow.nw_frag;
+    /* 从流的 unmasked key 中提取 4 个匹配字段 */
+    odp_port_t in_port = dp_flow->flow.in_port.odp_port;  /* 入端口 */
+    ovs_be16 vlan_tci = dp_flow->flow.vlans[0].tci;       /* 第一层 VLAN TCI */
+    ovs_be16 dl_type = dp_flow->flow.dl_type;             /* 以太网类型 */
+    uint8_t nw_frag = dp_flow->flow.nw_frag;              /* IP 分片标志 */
 
+    /* 增加引用计数，防止流在操作过程中被释放 */
     if (!dp_netdev_flow_ref(dp_flow)) {
-        return;
+        return;                                /* 流已死亡（ref_cnt=0），放弃插入 */
     }
 
     /* Avoid double insertion.  Should not happen in practice. */
-    dp_netdev_simple_match_remove(pmd, dp_flow);
+    dp_netdev_simple_match_remove(pmd, dp_flow);  /* 防御性移除：避免重复插入 */
 
+    /* 编码 4 个字段为 64 位 mark，计算哈希 */
     uint64_t mark = dp_netdev_simple_match_mark(in_port, dl_type,
                                                 nw_frag, vlan_tci);
     uint32_t hash = hash_uint64(mark);
 
-    dp_flow->simple_match_mark = mark;
-    cmap_insert(&pmd->simple_match_table,
+    dp_flow->simple_match_mark = mark;         /* 将 mark 存入流结构体 */
+    cmap_insert(&pmd->simple_match_table,      /* 插入 simple_match cmap 表 */
                 CONST_CAST(struct cmap_node *, &dp_flow->simple_match_node),
                 hash);
-    ccmap_inc(&pmd->n_simple_flows, odp_to_u32(in_port));
+    ccmap_inc(&pmd->n_simple_flows, odp_to_u32(in_port)); /* 该端口的 simple 流计数 +1 */
 
     VLOG_DBG("Simple match insert: "
              "core_id(%d),in_port(%"PRIu32"),mark(0x%016"PRIx64").",
              pmd->core_id, in_port, mark);
 }
 
+/* 从 simple_match_table 中移除流。
+ *
+ * 在流删除（dp_netdev_flow_del__）时调用。
+ * 先 lookup 确认表中确实存在该流（防止误删），再执行移除。 */
 static void
 dp_netdev_simple_match_remove(struct dp_netdev_pmd_thread *pmd,
                                struct dp_netdev_flow *dp_flow)
     OVS_REQUIRES(pmd->flow_mutex)
 {
+    /* 提取 4 个匹配字段 */
     odp_port_t in_port = dp_flow->flow.in_port.odp_port;
     ovs_be16 vlan_tci = dp_flow->flow.vlans[0].tci;
     ovs_be16 dl_type = dp_flow->flow.dl_type;
     uint8_t nw_frag = dp_flow->flow.nw_frag;
     struct dp_netdev_flow *flow;
+    /* 编码 mark 并计算哈希（移除时也需要哈希来定位 cmap 桶） */
     uint64_t mark = dp_netdev_simple_match_mark(in_port, dl_type,
                                                 nw_frag, vlan_tci);
     uint32_t hash = hash_uint64(mark);
 
+    /* 先查找确认：表中存在且确实是同一个流对象 */
     flow = dp_netdev_simple_match_lookup(pmd, in_port, dl_type,
                                          nw_frag, vlan_tci);
     if (flow == dp_flow) {
         VLOG_DBG("Simple match remove: "
                  "core_id(%d),in_port(%"PRIu32"),mark(0x%016"PRIx64").",
                  pmd->core_id, in_port, mark);
-        cmap_remove(&pmd->simple_match_table,
+        cmap_remove(&pmd->simple_match_table,  /* 从 cmap 中移除节点 */
                     CONST_CAST(struct cmap_node *, &flow->simple_match_node),
                     hash);
-        ccmap_dec(&pmd->n_simple_flows, odp_to_u32(in_port));
-        dp_netdev_flow_unref(flow);
+        ccmap_dec(&pmd->n_simple_flows, odp_to_u32(in_port)); /* simple 流计数 -1 */
+        dp_netdev_flow_unref(flow);            /* 释放插入时增加的引用 */
     }
 }
 
+/* 判断流是否为 simple_match：仅匹配 in_port/dl_type/nw_frag/vlan_tci
+ * 且 recirc_id=0, packet_type=PT_ETH。
+ *
+ * 判断逻辑：构造一个"最小通配符集"（miniflow_extract 一定会设置的字段），
+ * 然后检查该流的实际通配符是否与最小集完全一致。
+ * 如果流只匹配这些最小字段，则满足 simple_match 条件。
+ *
+ * 为什么这 4 个字段？因为 miniflow_extract() 对每个以太网包总会设置：
+ *   recirc_id, in_port, packet_type, dl_type, vlan_tci, nw_frag
+ * 其中 recirc_id/in_port/packet_type 是固定值不需要编码到 mark 中，
+ * 所以实际需要匹配的只有 dl_type + vlan_tci + nw_frag（加上 in_port 隐含匹配）。 */
 static bool
 dp_netdev_flow_is_simple_match(const struct match *match)
 {
     const struct flow *flow = &match->flow;
     const struct flow_wildcards *wc = &match->wc;
 
+    /* 前置条件：必须是首轮（recirc_id=0）且是以太网包 */
     if (flow->recirc_id || flow->packet_type != htonl(PT_ETH)) {
         return false;
     }
@@ -3437,10 +4242,11 @@ dp_netdev_flow_is_simple_match(const struct match *match)
     /* Check that flow matches only minimal set of fields that always set.
      * Also checking that VLAN VID+CFI is an exact match, because these
      * are not mandatory and could be masked. */
+    /* 构造"最小通配符集"：只包含 dpif-netdev 总会精确匹配的字段 */
     struct flow_wildcards *minimal = xmalloc(sizeof *minimal);
-    ovs_be16 vlan_tci_mask = htons(VLAN_VID_MASK | VLAN_CFI);
+    ovs_be16 vlan_tci_mask = htons(VLAN_VID_MASK | VLAN_CFI); /* VID+CFI 掩码 */
 
-    flow_wildcards_init_catchall(minimal);
+    flow_wildcards_init_catchall(minimal);     /* 初始化为全通配（全 0 掩码） */
     /* 'dpif-netdev' always has following in exact match:
      *   - recirc_id                   <-- recirc_id == 0 checked on input.
      *   - in_port                     <-- Will be checked on input.
@@ -3449,23 +4255,29 @@ dp_netdev_flow_is_simple_match(const struct match *match)
      *   - vlan_tci                    <-- Need to match with.
      *   - and nw_frag for ip packets. <-- Need to match with.
      */
-    WC_MASK_FIELD(minimal, recirc_id);
-    WC_MASK_FIELD(minimal, in_port);
-    WC_MASK_FIELD(minimal, packet_type);
-    WC_MASK_FIELD(minimal, dl_type);
-    WC_MASK_FIELD_MASK(minimal, vlans[0].tci, vlan_tci_mask);
-    WC_MASK_FIELD_MASK(minimal, nw_frag, FLOW_NW_FRAG_MASK);
+    WC_MASK_FIELD(minimal, recirc_id);         /* 设置 recirc_id 为精确匹配 */
+    WC_MASK_FIELD(minimal, in_port);           /* 设置 in_port 为精确匹配 */
+    WC_MASK_FIELD(minimal, packet_type);       /* 设置 packet_type 为精确匹配 */
+    WC_MASK_FIELD(minimal, dl_type);           /* 设置 dl_type 为精确匹配 */
+    WC_MASK_FIELD_MASK(minimal, vlans[0].tci, vlan_tci_mask); /* VID+CFI 精确匹配 */
+    WC_MASK_FIELD_MASK(minimal, nw_frag, FLOW_NW_FRAG_MASK);  /* 分片标志精确匹配 */
 
+    /* 检查：流的通配符是否比最小集有"额外"匹配字段？
+     * 若有 → 该流匹配了更多字段（如 nw_src, tp_dst 等），不是 simple match。
+     * 同时检查 vlan_tci 掩码必须恰好是 VID+CFI（不能只匹配部分位）。 */
     if (flow_wildcards_has_extra(minimal, wc)
         || wc->masks.vlans[0].tci != vlan_tci_mask) {
         free(minimal);
-        return false;
+        return false;                          /* 不满足 simple_match 条件 */
     }
     free(minimal);
 
-    return true;
+    return true;                               /* 满足条件：仅匹配最小字段集 */
 }
 
+/* 卸载 flow_put 操作完成后的后续处理：
+ * 成功 → 标记 offloaded；失败 → 清除标记并释放引用。
+ * 若这是已 dead 流的最后一个队列操作，触发 offload_flow_del。 */
 static void
 offload_flow_put_resume(struct dp_netdev *dp, struct dp_netdev_flow *flow,
                         struct dp_netdev_flow *previous_flow_reference,
@@ -3509,6 +4321,7 @@ offload_flow_put_resume(struct dp_netdev *dp, struct dp_netdev_flow *flow,
     }
 }
 
+/* 异步卸载 put 操作完成后的回调入口。 */
 static void
 offload_flow_put_resume_cb(void *aux, struct dpif_flow_stats *stats OVS_UNUSED,
                            unsigned pmd_id, void *flow_reference_,
@@ -3523,6 +4336,7 @@ offload_flow_put_resume_cb(void *aux, struct dpif_flow_stats *stats OVS_UNUSED,
                             pmd_id, error);
 }
 
+/* 请求将流卸载到硬件：构建 dpif_offload_flow_put 并提交。 */
 static void
 offload_flow_put(struct dp_netdev_pmd_thread *pmd, struct dp_netdev_flow *flow,
                  struct match *match, const struct nlattr *actions,
@@ -3559,6 +4373,13 @@ offload_flow_put(struct dp_netdev_pmd_thread *pmd, struct dp_netdev_flow *flow,
                             pmd->core_id, error);
 }
 
+/* 向 PMD 线程添加一条新流：
+ * 1) 构造 mask key 和 masked flow key
+ * 2) 分配 dp_netdev_flow，初始化 ufid/mega_ufid/actions
+ * 3) 插入 flow_table (cmap) 和 dpcls 分类器
+ * 4) 尝试插入 simple_match 优化表
+ * 5) 触发硬件卸载
+ * 6) 记录日志 */
 static struct dp_netdev_flow *
 dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
                    struct match *match, const ovs_u128 *ufid,
@@ -3639,6 +4460,9 @@ dp_netdev_flow_add(struct dp_netdev_pmd_thread *pmd,
     return flow;
 }
 
+/* 在单个 PMD 线程上执行 flow_put（创建或修改流）：
+ * CREATE: 若流不存在则调用 dp_netdev_flow_add 创建
+ * MODIFY: 若流已存在则替换其 actions（RCU 安全替换） */
 static int
 flow_put_on_pmd(struct dp_netdev_pmd_thread *pmd,
                 struct netdev_flow_key *key,
@@ -3722,6 +4546,8 @@ exit:
     return error;
 }
 
+/* dpif 接口的 flow_put 实现：解析 netlink key/mask，然后在指定或所有 PMD 上执行。
+ * in_port 必须为精确匹配。 */
 static int
 dpif_netdev_flow_put(struct dpif *dpif, const struct dpif_flow_put *put)
 {
@@ -3813,6 +4639,7 @@ dpif_netdev_flow_put(struct dpif *dpif, const struct dpif_flow_put *put)
     return error;
 }
 
+/* 在单个 PMD 线程上删除流：按 UFID 查找并移除。 */
 static int
 flow_del_on_pmd(struct dp_netdev_pmd_thread *pmd,
                 struct dpif_flow_stats *stats,
@@ -3837,6 +4664,7 @@ flow_del_on_pmd(struct dp_netdev_pmd_thread *pmd,
     return error;
 }
 
+/* dpif 接口的 flow_del 实现：在指定或所有 PMD 上删除流，聚合统计信息。 */
 static int
 dpif_netdev_flow_del(struct dpif *dpif, const struct dpif_flow_del *del)
 {
@@ -3879,13 +4707,21 @@ dpif_netdev_flow_del(struct dpif *dpif, const struct dpif_flow_del *del)
     return error;
 }
 
+/* =====================================================
+ * 流表遍历（Flow Dump）实现。
+ *
+ * 用于 ovs-dpctl dump-flows 等命令，遍历所有 PMD 线程的流表。
+ * 多线程安全：使用 mutex 保护遍历位置，支持并行 dump 线程。
+ * ===================================================== */
+
+/* 流遍历状态：记录当前遍历到的 PMD 线程和 flow 位置。 */
 struct dpif_netdev_flow_dump {
     struct dpif_flow_dump up;
-    struct cmap_position poll_thread_pos;
-    struct cmap_position flow_pos;
-    struct dp_netdev_pmd_thread *cur_pmd;
-    int status;
-    struct ovs_mutex mutex;
+    struct cmap_position poll_thread_pos;  /* 当前 PMD 在 poll_threads 中的位置 */
+    struct cmap_position flow_pos;         /* 当前流在 flow_table 中的位置 */
+    struct dp_netdev_pmd_thread *cur_pmd;  /* 当前正在遍历的 PMD */
+    int status;                            /* EOF 表示遍历结束 */
+    struct ovs_mutex mutex;                /* 保护多线程并发遍历 */
 };
 
 static struct dpif_netdev_flow_dump *
@@ -3917,6 +4753,7 @@ dpif_netdev_flow_dump_destroy(struct dpif_flow_dump *dump_)
     return 0;
 }
 
+/* 每个 dump 线程的私有状态，包含批量转换时使用的临时缓冲区。 */
 struct dpif_netdev_flow_dump_thread {
     struct dpif_flow_dump_thread up;
     struct dpif_netdev_flow_dump *dump;
@@ -3951,6 +4788,11 @@ dpif_netdev_flow_dump_thread_destroy(struct dpif_flow_dump_thread *thread_)
     free(thread);
 }
 
+/* 批量返回下一批流表项。遍历逻辑：
+ * 1) 从当前 PMD 的 flow_table 中取最多 flow_limit 条流
+ * 2) 当前 PMD 遍历完后切换到下一个 PMD
+ * 3) 所有 PMD 遍历完后设 status=EOF
+ * 4) 将内部流转换为 dpif_flow 格式返回 */
 static int
 dpif_netdev_flow_dump_next(struct dpif_flow_dump_thread *thread_,
                            struct dpif_flow *flows, int max_flows)
@@ -4029,6 +4871,9 @@ dpif_netdev_flow_dump_next(struct dpif_flow_dump_thread *thread_,
     return n_flows;
 }
 
+/* dpif 接口的 execute 实现：对单个报文执行指定 actions（慢路径）。
+ * 用于 packet-out、BFD 等非数据面生成的报文。
+ * 非 PMD 线程调用时需加 non_pmd_mutex。 */
 static int
 dpif_netdev_execute(struct dpif *dpif, struct dpif_execute *execute)
     OVS_NO_THREAD_SAFETY_ANALYSIS
@@ -4117,6 +4962,7 @@ dpif_netdev_execute(struct dpif *dpif, struct dpif_execute *execute)
     return 0;
 }
 
+/* dpif 接口的批量操作入口：依次执行 flow_put/flow_del/execute/flow_get。 */
 static void
 dpif_netdev_operate(struct dpif *dpif, struct dpif_op **ops, size_t n_ops)
 {
@@ -4145,7 +4991,15 @@ dpif_netdev_operate(struct dpif *dpif, struct dpif_op **ops, size_t n_ops)
     }
 }
 
+/* =====================================================
+ * PMD 自动负载均衡（Auto Load Balance）配置。
+ *
+ * 启用后，系统定期检查各 PMD 的负载率。
+ * 当负载超过阈值时标记 PMD 过载，触发 RXQ 重新分配。
+ * ===================================================== */
+
 /* Enable or Disable PMD auto load balancing. */
+/* 启用/禁用 PMD 自动负载均衡，记录当前配置参数。 */
 static void
 set_pmd_auto_lb(struct dp_netdev *dp, bool state, bool always_log)
 {
@@ -4172,6 +5026,15 @@ set_pmd_auto_lb(struct dp_netdev *dp, bool state, bool always_log)
     }
 }
 
+/* =====================================================
+ * PMD 睡眠（Sleep）配置。
+ *
+ * 当 PMD 空闲时可短暂 usleep 减少 CPU 占用。
+ * pmd-sleep-max 参数控制每个 PMD 的最大睡眠时间（微秒）。
+ * 支持全局默认值和每个 core 的独立配置。
+ * ===================================================== */
+
+/* 解析 pmd-sleep-max 配置字符串，格式为 "core_id:max_sleep" 或 "default_sleep"。 */
 static int
 parse_pmd_sleep_list(const char *max_sleep_list,
                      struct pmd_sleep **pmd_sleeps)
@@ -4245,6 +5108,7 @@ log_pmd_sleep(unsigned core_id, int numa_id, uint64_t pmd_max_sleep)
               "max sleep: %4"PRIu64" us.", numa_id, core_id, pmd_max_sleep);
 }
 
+/* 初始化 PMD 的 max_sleep 值：先用全局默认值，再检查是否有针对该 core 的配置。 */
 static void
 pmd_init_max_sleep(struct dp_netdev *dp, struct dp_netdev_pmd_thread *pmd)
 {
@@ -4266,6 +5130,7 @@ pmd_init_max_sleep(struct dp_netdev *dp, struct dp_netdev_pmd_thread *pmd)
     free(pmd_sleeps);
 }
 
+/* 将解析后的 sleep 配置应用到所有 PMD 线程。返回是否有值发生变化。 */
 static bool
 assign_sleep_values_to_pmds(struct dp_netdev *dp, int num_vals,
                             struct pmd_sleep *pmd_sleeps)
@@ -4299,6 +5164,7 @@ assign_sleep_values_to_pmds(struct dp_netdev *dp, int num_vals,
     return value_changed;
 }
 
+/* 日志输出所有 PMD 的 sleep 配置值。 */
 static void
 log_all_pmd_sleeps(struct dp_netdev *dp)
 {
@@ -4321,6 +5187,7 @@ log_all_pmd_sleeps(struct dp_netdev *dp)
     free(pmd_list);
 }
 
+/* 从 OVSDB 配置中读取并设置所有 PMD 的 max_sleep 值。 */
 static bool
 set_all_pmd_max_sleeps(struct dp_netdev *dp, const struct smap *config)
 {
@@ -4377,6 +5244,16 @@ set_all_pmd_max_sleeps(struct dp_netdev *dp, const struct smap *config)
 
 /* Applies datapath configuration from the database. Some of the changes are
  * actually applied in dpif_netdev_run(). */
+/* dpif 接口的 set_config 实现：从 OVSDB other_config 读取配置并应用。
+ * 主要配置项：
+ * - pmd-cpu-mask: PMD 线程绑核掩码
+ * - emc-insert-inv-prob: EMC 插入概率（1/N）
+ * - smc-enable: SMC 缓存开关
+ * - pmd-rxq-assign: RXQ 分配策略（roundrobin/cycles/group）
+ * - pmd-sleep-max: PMD 空闲睡眠上限
+ * - tx-flush-interval: TX 刷新间隔
+ * - pmd-perf-metrics: 性能指标采集开关
+ * - pmd-auto-lb*: 自动负载均衡参数 */
 static int
 dpif_netdev_set_config(struct dpif *dpif, const struct smap *other_config)
 {
@@ -4646,6 +5523,10 @@ dpif_netdev_pmd_polls_port(struct dp_netdev_pmd_thread *pmd,
 
 /* Updates port configuration from the database.  The changes are actually
  * applied in dpif_netdev_run(). */
+/* 端口级配置更新：
+ * - emc-enable: 控制该端口是否启用 EMC
+ * - pmd-rxq-affinity: RXQ 到 PMD 的亲和性绑定
+ * - tx-steering: TX 队列选择模式（thread 或 hash） */
 static int
 dpif_netdev_port_set_config(struct dpif *dpif, odp_port_t port_no,
                             const struct smap *cfg)
@@ -4730,6 +5611,7 @@ unlock:
     return error;
 }
 
+/* 队列到优先级的映射（userspace 数据面中直接映射）。 */
 static int
 dpif_netdev_queue_to_priority(const struct dpif *dpif OVS_UNUSED,
                               uint32_t queue_id, uint32_t *priority)
@@ -4739,8 +5621,13 @@ dpif_netdev_queue_to_priority(const struct dpif *dpif OVS_UNUSED,
 }
 
 
+/* =====================================================
+ * Actions 管理和 RXQ 周期统计。
+ * ===================================================== */
+
 /* Creates and returns a new 'struct dp_netdev_actions', whose actions are
  * a copy of the 'size' bytes of 'actions' input parameters. */
+/* 创建 actions 副本（用于 RCU 安全替换）。 */
 struct dp_netdev_actions *
 dp_netdev_actions_create(const struct nlattr *actions, size_t size)
 {
@@ -4755,6 +5642,7 @@ dp_netdev_actions_create(const struct nlattr *actions, size_t size)
     return netdev_actions;
 }
 
+/* 通过 RCU 安全地读取流的当前 actions。 */
 struct dp_netdev_actions *
 dp_netdev_flow_get_actions(const struct dp_netdev_flow *flow)
 {
@@ -4766,6 +5654,10 @@ dp_netdev_actions_free(struct dp_netdev_actions *actions)
 {
     free(actions);
 }
+
+/* RXQ 处理周期统计函数组：set/add/get 跟踪每个 RXQ 的 CPU 开销，
+ * 作为 RXQ 到 PMD 分配的负载均衡依据。
+ * intrvl (interval) 系列维护环形缓冲区记录最近几个周期的数据。 */
 
 static void
 dp_netdev_rxq_set_cycles(struct dp_netdev_rxq *rx,
@@ -4808,6 +5700,7 @@ dp_netdev_rxq_get_intrvl_cycles(struct dp_netdev_rxq *rx, unsigned idx)
     return processing_cycles;
 }
 
+/* PMD 性能指标开关：仅当平台支持 8 字节无锁原子操作时才可用。 */
 #if ATOMIC_ALWAYS_LOCK_FREE_8B
 static inline bool
 pmd_perf_metrics_enabled(const struct dp_netdev_pmd_thread *pmd)
@@ -4827,6 +5720,18 @@ pmd_perf_metrics_enabled(const struct dp_netdev_pmd_thread *pmd OVS_UNUSED)
 }
 #endif
 
+/* =====================================================
+ * TX 输出刷新。
+ *
+ * 报文经过 action 执行后，先缓存在 tx_port 的 output_pkts 批次中，
+ * 达到批次大小或超时后统一调用 netdev_send 发送。
+ * ===================================================== */
+
+/* 刷新单个端口的待发送报文批次：
+ * - XPS_HASH 模式：按报文 hash 分配到不同 TX 队列
+ * - XPS 模式：动态选择 TX 队列（可能有竞争）
+ * - THREAD 模式：使用 PMD 的固定 TX 队列（无竞争）
+ * 发送后记录耗时并按比例分配到各报文的来源 RXQ。 */
 static int
 dp_netdev_pmd_flush_output_on_port(struct dp_netdev_pmd_thread *pmd,
                                    struct tx_port *p)
@@ -4906,6 +5811,7 @@ dp_netdev_pmd_flush_output_on_port(struct dp_netdev_pmd_thread *pmd,
     return output_cnt;
 }
 
+/* 遍历所有输出端口，刷新已超时或 force 模式下的待发送批次。 */
 static int
 dp_netdev_pmd_flush_output_packets(struct dp_netdev_pmd_thread *pmd,
                                    bool force)
@@ -4926,41 +5832,60 @@ dp_netdev_pmd_flush_output_packets(struct dp_netdev_pmd_thread *pmd,
     return output_cnt;
 }
 
+/* 从指定 RXQ 接收一批数据包并进行处理 — PMD 收包的核心入口。
+ *
+ * 完整流程：
+ *   netdev_rxq_recv()        收包（DPDK burst / vhost dequeue）
+ *     → netdev_input_func()  MFEX 优化路径（可选）
+ *       → dp_netdev_input()  流表查找 + action 执行
+ *         → flush_output()   刷新输出缓冲到网卡
+ *
+ * 返回值：本次收到并处理的包数（0 表示无包）。 */
 static int
 dp_netdev_process_rxq_port(struct dp_netdev_pmd_thread *pmd,
                            struct dp_netdev_rxq *rxq,
                            odp_port_t port_no)
 {
     struct pmd_perf_stats *s = &pmd->perf_stats;
-    struct dp_packet_batch batch;
-    struct cycle_timer timer;
+    struct dp_packet_batch batch;    /* 本次 burst 收到的包批次 */
+    struct cycle_timer timer;        /* 计时器：统计收包+处理的总 TSC */
     int error;
-    int batch_cnt = 0;
-    int rem_qlen = 0, *qlen_p = NULL;
+    int batch_cnt = 0;               /* 收到的包数 */
+    int rem_qlen = 0, *qlen_p = NULL; /* vhost 队列剩余长度（仅 vhost 端口） */
     uint64_t cycles;
 
-    /* Measure duration for polling and processing rx burst. */
+    /* 启动计时器，记录从收包到处理完成的全部 CPU 周期 */
     cycle_timer_start(&pmd->perf_stats, &timer);
 
+    /* 设置当前正在处理的 RXQ（用于 action 执行时关联入队列） */
     pmd->ctx.last_rxq = rxq;
     dp_packet_batch_init(&batch);
 
-    /* Fetch the rx queue length only for vhostuser ports. */
+    /* 仅对 vhost 端口获取队列剩余长度（用于监控队列填充率） */
     if (pmd_perf_metrics_enabled(pmd) && rxq->is_vhost) {
         qlen_p = &rem_qlen;
     }
 
+    /* === 核心收包调用 ===
+     * 对 DPDK 端口：调用 rte_eth_rx_burst() 批量收包
+     * 对 vhost 端口：调用 rte_vhost_dequeue_burst() 从 VM 收包
+     * 返回 0 表示成功收到包，EAGAIN 表示无包可收 */
     error = netdev_rxq_recv(rxq->rx, &batch, qlen_p);
     if (!error) {
-        /* At least one packet received. */
+        /* 收到至少一个包 */
+
+        /* 重置 recirculation 深度计数器（新包从深度 0 开始） */
         *recirc_depth_get() = 0;
+        /* 更新 PMD 上下文中的时间戳 */
         pmd_thread_ctx_time_update(pmd);
         batch_cnt = dp_packet_batch_size(&batch);
+
+        /* 更新性能指标（仅在 pmd-perf-show 启用时） */
         if (pmd_perf_metrics_enabled(pmd)) {
-            /* Update batch histogram. */
+            /* 批次计数 + 每批包数直方图 */
             s->current.batches++;
             histogram_add_sample(&s->pkts_per_batch, batch_cnt);
-            /* Update the maximum vhost rx queue fill level. */
+            /* 记录 vhost 队列最大填充水位（收到的包 + 队列中剩余的包） */
             if (rxq->is_vhost && rem_qlen >= 0) {
                 uint32_t qfill = batch_cnt + rem_qlen;
                 if (qfill > s->current.max_vhost_qfill) {
@@ -4969,20 +5894,31 @@ dp_netdev_process_rxq_port(struct dp_netdev_pmd_thread *pmd,
             }
         }
 
-        /* Process packet batch. */
+        /* @veencn_260223: 为每个包打上收包时刻的 TSC 时间戳 */
+        LATENCY(pmd, STAMP_BATCH, &batch);
+
+        /* === 核心处理调用 ===
+         * 先尝试 MFEX 优化路径（netdev_input_func，如 AVX512 miniflow 提取），
+         * 如果返回非零（不支持或失败），回退到通用的 dp_netdev_input()。
+         * dp_netdev_input 内部完成：miniflow 提取 → EMC/SMC/dpcls 查找 → 执行 action */
         int ret = pmd->netdev_input_func(pmd, &batch, port_no);
         if (ret) {
             dp_netdev_input(pmd, &batch, port_no);
         }
 
-        /* Assign processing cycles to rx queue. */
+        /* 停止计时器，将本次收包+处理的总 CPU 周期数累加到 RXQ 统计。
+         * 这些数据被 dp_netdev_pmd_try_optimize() 采集，
+         * 用于 RXQ 到 PMD 的负载均衡分配决策。 */
         cycles = cycle_timer_stop(&pmd->perf_stats, &timer);
         dp_netdev_rxq_add_cycles(rxq, RXQ_CYCLES_PROC_CURR, cycles);
 
+        /* 刷新所有端口的输出缓冲（将 action 执行期间缓冲的包实际发送出去） */
         dp_netdev_pmd_flush_output_packets(pmd, false);
     } else {
-        /* Discard cycles. */
+        /* 无包可收 — 丢弃本次计时（不计入 RXQ 处理周期） */
         cycle_timer_stop(&pmd->perf_stats, &timer);
+        /* EAGAIN = 队列为空（正常），EOPNOTSUPP = 不支持的操作（正常）。
+         * 其他错误则限速打印日志。 */
         if (error != EAGAIN && error != EOPNOTSUPP) {
             static struct vlog_rate_limit rl = VLOG_RATE_LIMIT_INIT(1, 5);
 
@@ -4991,11 +5927,13 @@ dp_netdev_process_rxq_port(struct dp_netdev_pmd_thread *pmd,
         }
     }
 
+    /* 清除当前 RXQ 关联（表示本轮处理结束） */
     pmd->ctx.last_rxq = NULL;
 
     return batch_cnt;
 }
 
+/* 在 hmap 中按端口号查找 tx_port（发送端口缓存）。 */
 static struct tx_port *
 tx_port_lookup(const struct hmap *hmap, odp_port_t port_no)
 {
@@ -5010,6 +5948,7 @@ tx_port_lookup(const struct hmap *hmap, odp_port_t port_no)
     return NULL;
 }
 
+/* 在 cmap 中按 bond_id 查找 tx_bond（bond 发送缓存）。 */
 static struct tx_bond *
 tx_bond_lookup(const struct cmap *tx_bonds, uint32_t bond_id)
 {
@@ -5024,6 +5963,8 @@ tx_bond_lookup(const struct cmap *tx_bonds, uint32_t bond_id)
     return NULL;
 }
 
+/* 重新配置端口的 RXQ：关闭已有队列，应用 netdev 配置变更，重新打开。
+ * 在 reconfigure_datapath 中被调用。 */
 static int
 port_reconfigure(struct dp_netdev_port *port)
 {
@@ -5079,11 +6020,22 @@ port_reconfigure(struct dp_netdev_port *port)
     return 0;
 }
 
+/* =====================================================
+ * RXQ 调度器（Scheduler）数据结构和算法。
+ *
+ * 负责将各端口的 RXQ 分配到不同 PMD 线程，目标是负载均衡。
+ * 支持三种策略：
+ * - roundrobin: 轮询分配
+ * - cycles: 按处理周期数排序，贪心分配给最空闲的 PMD
+ * - group: 分组优化
+ * ===================================================== */
+
+/* NUMA 节点级别的调度信息列表。 */
 struct sched_numa_list {
     struct hmap numas;  /* Contains 'struct sched_numa'. */
 };
 
-/* Meta data for out-of-place pmd rxq assignments. */
+/* 调度器中每个 PMD 的状态：记录已分配的 RXQ 列表和累计处理周期。 */
 struct sched_pmd {
     struct sched_numa *numa;
     /* Associated PMD thread. */
@@ -5094,17 +6046,15 @@ struct sched_pmd {
     bool isolated;
 };
 
+/* 调度器中每个 NUMA 节点的状态：包含该节点上所有 PMD 的信息。 */
 struct sched_numa {
     struct hmap_node node;
     int numa_id;
-    /* PMDs on numa node. */
-    struct sched_pmd *pmds;
-    /* Num of PMDs on numa node. */
-    unsigned n_pmds;
-    /* Num of isolated PMDs on numa node. */
-    unsigned n_isolated;
-    int rr_cur_index;
-    bool rr_idx_inc;
+    struct sched_pmd *pmds;     /* 该 NUMA 上的 PMD 数组 */
+    unsigned n_pmds;            /* PMD 总数 */
+    unsigned n_isolated;        /* 隔离 PMD 数（用于固定绑定） */
+    int rr_cur_index;           /* roundrobin 当前索引 */
+    bool rr_idx_inc;            /* roundrobin 方向标志 */
 };
 
 static size_t
@@ -5815,6 +6765,9 @@ pmd_rebalance_dry_run_needed(struct dp_netdev *dp)
     return pmd_alb->do_dry_run = false;
 }
 
+/* 自动负载均衡的预演（dry run）：
+ * 比较当前分配和重新调度后的方差，判断是否值得重新分配。
+ * 仅当方差改善达到阈值时才返回 true 触发实际重分配。 */
 static bool
 pmd_rebalance_dry_run(struct dp_netdev *dp)
     OVS_REQ_RDLOCK(dp->port_rwlock)
@@ -5878,6 +6831,7 @@ pmd_rebalance_dry_run(struct dp_netdev *dp)
     return thresh_met;
 }
 
+/* 通知所有需要重载的 PMD 线程执行重载，并等待它们完成。 */
 static void
 reload_affected_pmds(struct dp_netdev *dp)
 {
@@ -5904,6 +6858,10 @@ reload_affected_pmds(struct dp_netdev *dp)
     }
 }
 
+/* 根据 pmd-cpu-mask 重新配置 PMD 线程：
+ * 1) 销毁不再需要的 PMD 线程
+ * 2) 创建新增的 PMD 线程（每个 core 一个）
+ * 3) 必要时调整 static_tx_qid */
 static void
 reconfigure_pmd_threads(struct dp_netdev *dp)
     OVS_REQ_RDLOCK(dp->port_rwlock)
@@ -6000,6 +6958,7 @@ reconfigure_pmd_threads(struct dp_netdev *dp)
     ovs_numa_dump_destroy(pmd_cores);
 }
 
+/* 从 PMD 中移除已删除或需要重配置的端口的 RXQ 和 TX 缓存。 */
 static void
 pmd_remove_stale_ports(struct dp_netdev *dp,
                        struct dp_netdev_pmd_thread *pmd)
@@ -6032,6 +6991,13 @@ pmd_remove_stale_ports(struct dp_netdev *dp,
 /* Must be called each time a port is added/removed or the cmask changes.
  * This creates and destroys pmd threads, reconfigures ports, opens their
  * rxqs and assigns all rxqs/txqs to pmd threads. */
+/* 重新配置 datapath — 端口增删或 CPU 掩码变更时调用。
+ * 核心流程：
+ * 1. 重新配置所有端口（打开 RXQ、设置 TXQ 模式）
+ * 2. 根据 pmd_cmask 创建/销毁 PMD 线程
+ * 3. 将所有 RXQ 按调度策略分配到 PMD 线程
+ * 4. 为每个 PMD 添加所有端口的 TX 缓存
+ * 5. 触发 PMD 重新加载 */
 static void
 reconfigure_datapath(struct dp_netdev *dp)
     OVS_REQ_RDLOCK(dp->port_rwlock)
@@ -6269,6 +7235,13 @@ variance(uint64_t a[], int n)
 }
 
 /* Return true if needs to revalidate datapath flows. */
+/* dpif_netdev_run — 主线程的周期性调用函数。
+ * 由 ofproto-dpif 在主循环中调用，处理以下任务：
+ * 1. non-PMD 线程处理非 DPDK 端口（如 tap 端口）的收包
+ * 2. 检查端口配置变更，按需触发 datapath 重配置
+ * 3. 检查隧道配置变更，按需刷新 tnl 端口
+ * 4. 自动负载均衡：检测 PMD 负载，按需重分配 RXQ
+ * 返回 true 表示需要重新验证流表。 */
 static bool
 dpif_netdev_run(struct dpif *dpif)
 {
@@ -6370,6 +7343,8 @@ dpif_netdev_run(struct dpif *dpif)
     return false;
 }
 
+/* dpif_netdev_wait — 在 poll_block 前注册所有需要等待的事件：
+ * 端口重配置需求、非 PMD 端口的 RXQ、隧道配置变更。 */
 static void
 dpif_netdev_wait(struct dpif *dpif)
 {
@@ -6393,6 +7368,7 @@ dpif_netdev_wait(struct dpif *dpif)
     seq_wait(tnl_conf_seq, dp->last_tnl_conf_seq);
 }
 
+/* 释放 PMD 线程的端口发送缓存：刷新未发送的报文，释放 TX 端口缓存。 */
 static void
 pmd_free_cached_ports(struct dp_netdev_pmd_thread *pmd)
 {
@@ -6417,6 +7393,9 @@ pmd_free_cached_ports(struct dp_netdev_pmd_thread *pmd)
  * thread-local copies. Copy to 'pmd->tnl_port_cache' if it is a tunnel
  * device, otherwise to 'pmd->send_port_cache' if the port has at least
  * one txq. */
+/* 将共享的 tx_ports 复制到线程本地缓存：
+ * 隧道端口 → tnl_port_cache，普通端口 → send_port_cache。
+ * 这样 PMD 转发时无需加锁访问共享结构。 */
 static void
 pmd_load_cached_ports(struct dp_netdev_pmd_thread *pmd)
     OVS_REQUIRES(pmd->port_mutex)
@@ -6455,6 +7434,7 @@ pmd_load_cached_ports(struct dp_netdev_pmd_thread *pmd)
     }
 }
 
+/* 从全局 TX 队列 ID 池中为 PMD 分配一个静态 TX 队列号。 */
 static void
 pmd_alloc_static_tx_qid(struct dp_netdev_pmd_thread *pmd)
 {
@@ -6477,95 +7457,138 @@ pmd_free_static_tx_qid(struct dp_netdev_pmd_thread *pmd)
     ovs_mutex_unlock(&pmd->dp->tx_qid_pool_mutex);
 }
 
+/* 加载 PMD 的轮询队列列表和端口缓存。
+ * 将 pmd->poll_list（hmap）中的 RXQ 信息复制到本地 poll_list 数组，
+ * 同时刷新 TX 端口缓存（send_port_cache / tnl_port_cache）。
+ * 返回值：本 PMD 需要轮询的 RXQ 数量。
+ *
+ * 此函数在 PMD 线程启动和每次 reload 时调用，
+ * 确保 PMD 使用最新的端口/队列配置。 */
 static int
 pmd_load_queues_and_ports(struct dp_netdev_pmd_thread *pmd,
                           struct polled_queue **ppoll_list)
 {
-    struct polled_queue *poll_list = *ppoll_list;
+    struct polled_queue *poll_list = *ppoll_list;  /* 复用上次分配的数组（或 NULL） */
     struct rxq_poll *poll;
     int i;
 
+    /* 加锁保护 pmd->poll_list 和端口缓存的读取。
+     * 控制线程（reconfigure_pmd_threads）会修改 poll_list，
+     * 因此必须在锁保护下拷贝。 */
     ovs_mutex_lock(&pmd->port_mutex);
+
+    /* 按当前 poll_list 的大小重新分配数组。
+     * xrealloc 在 poll_list 为 NULL 时等价于 xmalloc。 */
     poll_list = xrealloc(poll_list, hmap_count(&pmd->poll_list)
                                     * sizeof *poll_list);
 
+    /* 遍历 pmd->poll_list（hmap），将每个 RXQ 的信息
+     * 拷贝到本地 poll_list 数组中（避免在热路径中持锁访问 hmap）。 */
     i = 0;
     HMAP_FOR_EACH (poll, node, &pmd->poll_list) {
-        poll_list[i].rxq = poll->rxq;
-        poll_list[i].port_no = poll->rxq->port->port_no;
-        poll_list[i].emc_enabled = poll->rxq->port->emc_enabled;
-        poll_list[i].rxq_enabled = netdev_rxq_enabled(poll->rxq->rx);
+        poll_list[i].rxq = poll->rxq;               /* RXQ 指针 */
+        poll_list[i].port_no = poll->rxq->port->port_no;  /* 入端口号 */
+        poll_list[i].emc_enabled = poll->rxq->port->emc_enabled;  /* EMC 开关 */
+        poll_list[i].rxq_enabled = netdev_rxq_enabled(poll->rxq->rx);  /* RXQ 是否可用 */
+        /* 记录端口配置序列号，用于检测端口配置变更 */
         poll_list[i].change_seq =
                      netdev_get_change_seq(poll->rxq->port->netdev);
         i++;
     }
 
+    /* 刷新本 PMD 的 TX 端口缓存：
+     * 从 pmd->tx_ports（由控制线程管理）拷贝到
+     * pmd->send_port_cache 和 pmd->tnl_port_cache。 */
     pmd_load_cached_ports(pmd);
 
     ovs_mutex_unlock(&pmd->port_mutex);
 
-    *ppoll_list = poll_list;
-    return i;
+    *ppoll_list = poll_list;  /* 返回更新后的数组指针 */
+    return i;                  /* 返回 RXQ 数量 */
 }
 
+/* PMD 线程主函数 — 每个 PMD 线程的入口点。
+ * 核心逻辑是一个无限轮询循环：
+ * 1. 绑定 CPU 核心、DPDK 线程、分配 TX 队列
+ * 2. 循环遍历分配的所有 RXQ：
+ *    a. dp_netdev_process_rxq_port() — 从 RXQ 收包并处理
+ *    b. 定期执行优化（dpcls 子表排序、miniflow 提取函数切换）
+ *    c. 定期执行 RCU 静默、刷新输出缓冲、更新统计
+ * 3. 检测 reload 信号：端口变更时重新加载队列列表
+ * 4. 低负载时可进入微秒级休眠以降低 CPU 使用率
+ * PMD 线程是 OVS-DPDK 的性能核心。 */
 static void *
 pmd_thread_main(void *f_)
 {
-    struct dp_netdev_pmd_thread *pmd = f_;
-    struct pmd_perf_stats *s = &pmd->perf_stats;
-    unsigned int lc = 0;
-    struct polled_queue *poll_list;
-    bool wait_for_reload = false;
-    bool dpdk_attached;
-    bool reload_tx_qid;
-    bool exiting;
-    bool reload;
-    int poll_cnt;
+    struct dp_netdev_pmd_thread *pmd = f_;  /* 当前 PMD 线程上下文 */
+    struct pmd_perf_stats *s = &pmd->perf_stats;  /* 性能统计指针（缩短引用） */
+    unsigned int lc = 0;                /* 低频操作计数器，每 1024 次迭代触发一次优化 */
+    struct polled_queue *poll_list;      /* 本 PMD 负责轮询的 RXQ 列表 */
+    bool wait_for_reload = false;       /* 是否需要忙等 reload 信号（而非阻塞等待） */
+    bool dpdk_attached;                 /* DPDK EAL 线程是否已绑定 */
+    bool reload_tx_qid;                /* reload 时是否需要重新分配 TX 队列 ID */
+    bool exiting;                       /* PMD 是否应退出 */
+    bool reload;                        /* reload 信号标志 */
+    int poll_cnt;                       /* poll_list 中的 RXQ 数量 */
     int i;
-    int process_packets = 0;
-    uint64_t sleep_time = 0;
+    int process_packets = 0;            /* 单次 rxq 收包处理的包数 */
+    uint64_t sleep_time = 0;            /* 当前休眠时间（微秒），逐步递增直到 max_sleep */
 
     poll_list = NULL;
 
-    /* Stores the pmd thread's 'pmd' to 'per_pmd_key'. */
+    /* 将 pmd 指针存入线程局部存储，供其他函数通过 per_pmd_key 获取当前 PMD */
     ovsthread_setspecific(pmd->dp->per_pmd_key, pmd);
+    /* 绑定线程到指定 CPU 核心（NUMA 亲和性） */
     ovs_numa_thread_setaffinity_core(pmd->core_id);
+    /* 将此线程注册到 DPDK EAL（lcore 管理） */
     dpdk_attached = dpdk_attach_thread(pmd->core_id);
+    /* 加载分配给本 PMD 的 RXQ 列表和端口缓存 */
     poll_cnt = pmd_load_queues_and_ports(pmd, &poll_list);
+    /* 初始化 DFC（EMC + SMC）缓存 */
     dfc_cache_init(&pmd->flow_cache);
+    /* 为本 PMD 分配静态 TX 队列 ID（用于非 XPS 模式的发送） */
     pmd_alloc_static_tx_qid(pmd);
+    /* 设置定时器分辨率为纳秒级（高精度计时） */
     set_timer_resolution(PMD_TIMER_RES_NS);
 
+    /* === reload 入口 ===
+     * 每次 reload（端口变更、RXQ 重分配）后跳转到这里重新初始化。 */
 reload:
+    /* 重置过载计数器 */
     atomic_count_init(&pmd->pmd_overloaded, 0);
 
+    /* 重置负载统计间隔的 TSC 基准和累计周期数 */
     pmd->intrvl_tsc_prev = 0;
     atomic_store_relaxed(&pmd->intrvl_cycles, 0);
 
+    /* 如果 DPDK 线程未绑定（可能之前 detach 过），尝试重新绑定 */
     if (!dpdk_attached) {
         dpdk_attached = dpdk_attach_thread(pmd->core_id);
     }
 
-    /* List port/core affinity */
+    /* 打印本 PMD 处理的端口/队列信息，并重置 RXQ 周期计数器 */
     for (i = 0; i < poll_cnt; i++) {
        VLOG_DBG("Core %d processing port \'%s\' with queue-id %d\n",
                 pmd->core_id, netdev_rxq_get_name(poll_list[i].rxq->rx),
                 netdev_rxq_get_queue_id(poll_list[i].rxq->rx));
-       /* Reset the rxq current cycles counter. */
+       /* 重置当前处理周期计数（用于 RXQ 负载均衡统计） */
        dp_netdev_rxq_set_cycles(poll_list[i].rxq, RXQ_CYCLES_PROC_CURR, 0);
+       /* 清零所有间隔采样槽位 */
        for (int j = 0; j < PMD_INTERVAL_MAX; j++) {
            dp_netdev_rxq_set_intrvl_cycles(poll_list[i].rxq, 0);
        }
     }
 
+    /* 如果没有分配到任何 RXQ，PMD 需要等待 reload 信号 */
     if (!poll_cnt) {
         if (wait_for_reload) {
-            /* Don't sleep, control thread will ask for a reload shortly. */
+            /* 控制线程马上会发送 reload，忙等即可（不阻塞） */
             do {
                 atomic_read_explicit(&pmd->reload, &reload,
                                      memory_order_acquire);
             } while (!reload);
         } else {
+            /* 通过 seq 机制阻塞等待，直到有新的 reload 序列号 */
             while (seq_read(pmd->reload_seq) == pmd->last_reload_seq) {
                 seq_wait(pmd->reload_seq, pmd->last_reload_seq);
                 poll_block();
@@ -6573,82 +7596,101 @@ reload:
         }
     }
 
+    /* 清零所有忙碌周期间隔槽位（用于负载均衡决策） */
     for (i = 0; i < PMD_INTERVAL_MAX; i++) {
         atomic_store_relaxed(&pmd->busy_cycles_intrvl[i], 0);
     }
+    /* 重置间隔采样索引 */
     atomic_count_set(&pmd->intrvl_idx, 0);
+    /* 初始化 TSC 计数器基准 */
     cycles_counter_update(s);
 
+    /* 设置下一次 RCU 静默点的时间 */
     pmd->next_rcu_quiesce = pmd->ctx.now + PMD_RCU_QUIESCE_INTERVAL;
 
-    /* Protect pmd stats from external clearing while polling. */
+    /* 加锁保护性能统计，防止外部（如 pmd-perf-show）在轮询时清除统计 */
     ovs_mutex_lock(&pmd->perf_stats.stats_mutex);
-    for (;;) {
-        uint64_t rx_packets = 0, tx_packets = 0;
-        uint64_t time_slept = 0;
-        uint64_t max_sleep;
 
+    /* === PMD 主轮询循环 ===
+     * 每次迭代：收包 → 处理 → 发包 → 休眠(可选) → RCU → 优化 → 检查 reload */
+    for (;;) {
+        uint64_t rx_packets = 0, tx_packets = 0;  /* 本次迭代的收发包计数 */
+        uint64_t time_slept = 0;                   /* 本次迭代的休眠周期数 */
+        uint64_t max_sleep;                         /* 配置的最大休眠时间（微秒） */
+
+        /* 记录迭代起始时间戳 */
         pmd_perf_start_iteration(s);
 
+        /* 读取全局配置：SMC 是否启用、最大休眠时间 */
         atomic_read_relaxed(&pmd->dp->smc_enable_db, &pmd->ctx.smc_enable_db);
         atomic_read_relaxed(&pmd->max_sleep, &max_sleep);
 
+        /* --- 第一阶段：逐个 RXQ 收包并处理 --- */
         for (i = 0; i < poll_cnt; i++) {
 
+            /* 跳过被禁用的 RXQ（如端口被管理员 down 掉） */
             if (!poll_list[i].rxq_enabled) {
                 continue;
             }
 
+            /* 根据 per-RXQ 的 EMC 开关决定是否启用 EMC 插入 */
             if (poll_list[i].emc_enabled) {
                 atomic_read_relaxed(&pmd->dp->emc_insert_min,
                                     &pmd->ctx.emc_insert_min);
             } else {
-                pmd->ctx.emc_insert_min = 0;
+                pmd->ctx.emc_insert_min = 0;  /* EMC 禁用：不插入新条目 */
             }
 
+            /* 核心收包+处理：从 RXQ 收包 → miniflow 提取 → 流表查找 → 执行 action */
             process_packets =
                 dp_netdev_process_rxq_port(pmd, poll_list[i].rxq,
                                            poll_list[i].port_no);
             rx_packets += process_packets;
+            /* 收到足够多的包时重置休眠时间（高负载不休眠） */
             if (process_packets >= PMD_SLEEP_THRESH) {
                 sleep_time = 0;
             }
         }
 
+        /* --- 第二阶段：无收包时刷新待发送队列 ---
+         * 如果本轮没收到任何包，检查是否有缓冲的待发送包需要刷出。
+         * 此时需要手动更新时间戳（因为收包路径未执行时间更新）。 */
         if (!rx_packets) {
-            /* We didn't receive anything in the process loop.
-             * Check if we need to send something.
-             * There was no time updates on current iteration. */
             pmd_thread_ctx_time_update(pmd);
+            /* 刷新输出缓冲。若配置了休眠且当前有休眠，使用惰性刷新 */
             tx_packets = dp_netdev_pmd_flush_output_packets(pmd,
                                                    max_sleep && sleep_time
                                                    ? true : false);
         }
 
+        /* --- 第三阶段：自适应休眠（降低空闲时 CPU 使用率）---
+         * 仅在 max_sleep > 0（配置了 pmd-sleep）时启用。
+         * 休眠时间从 0 开始，每次迭代增加 PMD_SLEEP_INC_US 微秒，
+         * 直到 max_sleep。一旦收到包（>= PMD_SLEEP_THRESH），重置为 0。 */
         if (max_sleep) {
-            /* Check if a sleep should happen on this iteration. */
             if (sleep_time) {
                 struct cycle_timer sleep_timer;
 
+                /* 执行纳秒级休眠（不触发 RCU 静默） */
                 cycle_timer_start(&pmd->perf_stats, &sleep_timer);
                 xnanosleep_no_quiesce(sleep_time * 1000);
                 time_slept = cycle_timer_stop(&pmd->perf_stats, &sleep_timer);
                 pmd_thread_ctx_time_update(pmd);
             }
             if (sleep_time < max_sleep) {
-                /* Increase sleep time for next iteration. */
+                /* 逐步增加休眠时间 */
                 sleep_time += PMD_SLEEP_INC_US;
             } else {
                 sleep_time = max_sleep;
             }
         } else {
-            /* Reset sleep time as max sleep policy may have been changed. */
+            /* max_sleep 被清零（策略变更），重置休眠时间 */
             sleep_time = 0;
         }
 
-        /* Do RCU synchronization at fixed interval.  This ensures that
-         * synchronization would not be delayed long even at high load of
-         * packet processing. */
+        /* --- 第四阶段：RCU 定期静默 ---
+         * 在固定间隔执行 RCU 静默，确保高负载下也能及时回收内存。
+         * RCU 静默允许其他线程安全释放被 ovsrcu_postpone() 延迟的对象。 */
         if (pmd->ctx.now > pmd->next_rcu_quiesce) {
             if (!ovsrcu_try_quiesce()) {
                 pmd->next_rcu_quiesce =
@@ -6656,17 +7698,22 @@ reload:
             }
         }
 
+        /* --- 第五阶段：低频维护操作（每 1024 次迭代一次）--- */
         if (lc++ > 1024) {
             lc = 0;
 
+            /* 尝试清除覆盖率计数器（调试用） */
             coverage_try_clear();
+            /* 优化 dpcls：按命中率对子表排序、切换 miniflow 提取函数 */
             dp_netdev_pmd_try_optimize(pmd, poll_list, poll_cnt);
+            /* 再次尝试 RCU 静默，并做 EMC 慢速清扫（淘汰过期条目） */
             if (!ovsrcu_try_quiesce()) {
                 emc_cache_slow_sweep(&((pmd->flow_cache).emc_cache));
                 pmd->next_rcu_quiesce =
                     pmd->ctx.now + PMD_RCU_QUIESCE_INTERVAL;
             }
 
+            /* 检查端口配置是否变更（change_seq），更新 RXQ 启用状态 */
             for (i = 0; i < poll_cnt; i++) {
                 uint64_t current_seq =
                          netdev_get_change_seq(poll_list[i].rxq->port->netdev);
@@ -6678,43 +7725,57 @@ reload:
             }
         }
 
+        /* --- 第六阶段：检查 reload 信号 ---
+         * 如果控制线程设置了 reload 标志（端口增删、RXQ 重分配等），
+         * 跳出主循环去重新加载配置。 */
         atomic_read_explicit(&pmd->reload, &reload, memory_order_acquire);
         if (OVS_UNLIKELY(reload)) {
             break;
         }
 
+        /* 记录本次迭代的统计数据（收包数、发包数、休眠时间） */
         pmd_perf_end_iteration(s, rx_packets, tx_packets, time_slept,
                                pmd_perf_metrics_enabled(pmd));
     }
+    /* 释放统计锁 */
     ovs_mutex_unlock(&pmd->perf_stats.stats_mutex);
 
+    /* === reload 处理 ===
+     * 跳出主循环后，重新加载 RXQ 列表和端口缓存，
+     * 读取控制线程设置的各项 reload 标志。 */
     poll_cnt = pmd_load_queues_and_ports(pmd, &poll_list);
+    /* 是否需要忙等下一次 reload（两阶段 reload 时使用） */
     atomic_read_relaxed(&pmd->wait_for_reload, &wait_for_reload);
+    /* 是否需要重新分配 TX 队列 ID */
     atomic_read_relaxed(&pmd->reload_tx_qid, &reload_tx_qid);
+    /* 是否收到退出信号 */
     atomic_read_relaxed(&pmd->exit, &exiting);
-    /* Signal here to make sure the pmd finishes
-     * reloading the updated configuration. */
+    /* 通知控制线程本 PMD 已完成 reload 配置的加载 */
     dp_netdev_pmd_reload_done(pmd);
 
+    /* TX 队列 ID 需要重新分配（如端口增删导致队列数变化） */
     if (reload_tx_qid) {
         pmd_free_static_tx_qid(pmd);
         pmd_alloc_static_tx_qid(pmd);
     }
 
+    /* 未收到退出信号则跳转回 reload 标签继续轮询 */
     if (!exiting) {
         goto reload;
     }
 
-    pmd_free_static_tx_qid(pmd);
-    dfc_cache_uninit(&pmd->flow_cache);
-    free(poll_list);
-    pmd_free_cached_ports(pmd);
+    /* === PMD 线程退出清理 === */
+    pmd_free_static_tx_qid(pmd);       /* 释放 TX 队列 ID */
+    dfc_cache_uninit(&pmd->flow_cache); /* 销毁 EMC + SMC 缓存 */
+    free(poll_list);                     /* 释放轮询列表 */
+    pmd_free_cached_ports(pmd);          /* 释放端口缓存（send/tnl） */
     if (dpdk_attached) {
-        dpdk_detach_thread();
+        dpdk_detach_thread();            /* 从 DPDK EAL 注销线程 */
     }
     return NULL;
 }
 
+/* 禁用 upcall（获取写锁阻止新的 upcall 处理）。 */
 static void
 dp_netdev_disable_upcall(struct dp_netdev *dp)
     OVS_ACQUIRES(dp->upcall_rwlock)
@@ -6723,7 +7784,17 @@ dp_netdev_disable_upcall(struct dp_netdev *dp)
 }
 
 
-/* Meters */
+/* =====================================================
+ * Meter（QoS 限速器）实现。
+ *
+ * 支持按包速率（pktps）或按位速率（kbps）限速。
+ * 每个 meter 包含多个 band（限速档位），每个 band 有独立的令牌桶。
+ * 超过速率的报文会被丢弃（DROP band）。
+ *
+ * 令牌桶使用原子操作实现，支持多 PMD 线程并发计量。
+ * ===================================================== */
+
+/* 返回 meter 能力信息（最大数量、支持的 band 类型等）。 */
 static void
 dpif_netdev_meter_get_features(const struct dpif * dpif OVS_UNUSED,
                                struct ofputil_meter_features *features)
@@ -6738,6 +7809,7 @@ dpif_netdev_meter_get_features(const struct dpif * dpif OVS_UNUSED,
 /* Tries to atomically add 'n' to 'value' in terms of saturation arithmetic,
  * i.e., if the result will be larger than 'max_value', will store 'max_value'
  * instead. */
+/* 饱和加法：加到最大值后不再增长（用于令牌桶补充）。 */
 static void
 atomic_sat_add(atomic_uint64_t *value, uint64_t n, uint64_t max_value)
 {
@@ -6754,6 +7826,7 @@ atomic_sat_add(atomic_uint64_t *value, uint64_t n, uint64_t max_value)
 /* Tries to atomically subtract 'n' from 'value'.  Does not perform the
  * operation and returns 'false' if the result will be less than 'min_value'.
  * Otherwise, stores the result and returns 'true'. */
+/* 有界减法：不够减时返回 false（用于令牌桶消耗）。 */
 static bool
 atomic_bound_sub(atomic_uint64_t *value, uint64_t n, uint64_t min_value)
 {
@@ -6771,6 +7844,10 @@ atomic_bound_sub(atomic_uint64_t *value, uint64_t n, uint64_t min_value)
 
 /* Applies the meter identified by 'meter_id' to 'packets_'.  Packets
  * that exceed a band are dropped in-place. */
+/* 对一批报文执行 meter 计量：
+ * 1) 按时间差补充令牌桶
+ * 2) 对每个报文检查是否超过各 band 的速率
+ * 3) 超速的报文就地丢弃（从 batch 中移除） */
 static void
 dp_netdev_run_meter(struct dp_netdev *dp, struct dp_packet_batch *packets_,
                     uint32_t meter_id, long long int now_ms)
@@ -6914,6 +7991,8 @@ dp_netdev_run_meter(struct dp_netdev *dp, struct dp_packet_batch *packets_,
 }
 
 /* Meter set/get/del processing is still single-threaded. */
+/* 设置（创建/更新）一个 meter：验证参数、分配 dp_meter、
+ * 初始化 band 的速率和突发大小、插入 cmap。 */
 static int
 dpif_netdev_meter_set(struct dpif *dpif, ofproto_meter_id meter_id,
                       struct ofputil_meter_config *config)
@@ -6987,6 +8066,7 @@ dpif_netdev_meter_set(struct dpif *dpif, ofproto_meter_id meter_id,
     return 0;
 }
 
+/* 获取 meter 的统计信息（总包/字节数，各 band 的丢弃包/字节数）。 */
 static int
 dpif_netdev_meter_get(const struct dpif *dpif,
                       ofproto_meter_id meter_id_,
@@ -7023,6 +8103,7 @@ dpif_netdev_meter_get(const struct dpif *dpif,
     return 0;
 }
 
+/* 删除 meter：先获取统计信息，再从哈希表中移除并释放。 */
 static int
 dpif_netdev_meter_del(struct dpif *dpif,
                       ofproto_meter_id meter_id_,
@@ -7051,6 +8132,7 @@ dpif_netdev_disable_upcall(struct dpif *dpif)
     dp_netdev_disable_upcall(dp);
 }
 
+/* 启用 upcall（释放写锁允许新的 upcall 处理）。 */
 static void
 dp_netdev_enable_upcall(struct dp_netdev *dp)
     OVS_RELEASES(dp->upcall_rwlock)
@@ -7066,6 +8148,7 @@ dpif_netdev_enable_upcall(struct dpif *dpif)
     dp_netdev_enable_upcall(dp);
 }
 
+/* PMD 完成重载：清除 reload/wait_for_reload 标志，更新序列号。 */
 static void
 dp_netdev_pmd_reload_done(struct dp_netdev_pmd_thread *pmd)
 {
@@ -7080,6 +8163,7 @@ dp_netdev_pmd_reload_done(struct dp_netdev_pmd_thread *pmd)
  * 'core_id' is NON_PMD_CORE_ID).
  *
  * Caller must unrefs the returned reference.  */
+/* 按 core_id 查找 PMD 线程并增加引用计数。调用者负责 unref。 */
 static struct dp_netdev_pmd_thread *
 dp_netdev_get_pmd(struct dp_netdev *dp, unsigned core_id)
 {
@@ -7096,6 +8180,7 @@ dp_netdev_get_pmd(struct dp_netdev *dp, unsigned core_id)
 }
 
 /* Sets the 'struct dp_netdev_pmd_thread' for non-pmd threads. */
+/* 创建非 PMD 线程的伪 PMD 结构（用于主线程处理非 DPDK 端口）。 */
 static void
 dp_netdev_set_nonpmd(struct dp_netdev *dp)
     OVS_REQ_WRLOCK(dp->port_rwlock)
@@ -7142,6 +8227,9 @@ dp_netdev_pmd_get_next(struct dp_netdev *dp, struct cmap_position *pos)
 }
 
 /* Configures the 'pmd' based on the input argument. */
+/* 初始化 PMD 线程结构体：设置 core_id、NUMA、flow_table、classifiers、
+ * 性能统计、netdev_input 函数指针、miniflow 提取函数等。
+ * 对非 PMD 线程（NON_PMD_CORE_ID）还会初始化 flow_cache 和 TX 队列。 */
 static void
 dp_netdev_configure_pmd(struct dp_netdev_pmd_thread *pmd, struct dp_netdev *dp,
                         unsigned core_id, int numa_id)
@@ -7194,10 +8282,12 @@ dp_netdev_configure_pmd(struct dp_netdev_pmd_thread *pmd, struct dp_netdev *dp,
         pmd_alloc_static_tx_qid(pmd);
     }
     pmd_perf_stats_init(&pmd->perf_stats);
+    latency_stats_init(&pmd->latency_stats); /* @veencn_260223 */
     cmap_insert(&dp->poll_threads, CONST_CAST(struct cmap_node *, &pmd->node),
                 hash_int(core_id, 0));
 }
 
+/* 销毁 PMD 结构体：清空流表、销毁所有 cmap/hmap、释放内存。 */
 static void
 dp_netdev_destroy_pmd(struct dp_netdev_pmd_thread *pmd)
     OVS_NO_THREAD_SAFETY_ANALYSIS
@@ -7231,6 +8321,7 @@ dp_netdev_destroy_pmd(struct dp_netdev_pmd_thread *pmd)
 
 /* Stops the pmd thread, removes it from the 'dp->poll_threads',
  * and unrefs the struct. */
+/* 停止并删除 PMD 线程：设 exit 标志，等待线程退出，清理端口和流。 */
 static void
 dp_netdev_del_pmd(struct dp_netdev *dp, struct dp_netdev_pmd_thread *pmd)
 {
@@ -7455,12 +8546,14 @@ dp_netdev_del_bond_tx_from_pmd(struct dp_netdev_pmd_thread *pmd,
     ovs_mutex_unlock(&pmd->bond_mutex);
 }
 
+/* 返回数据路径版本信息（内置版本）。 */
 static char *
 dpif_netdev_get_datapath_version(void)
 {
      return xstrdup("<built-in>");
 }
 
+/* 更新流的统计信息：包数、字节数、最后使用时间、TCP 标志。 */
 static void
 dp_netdev_flow_used(struct dp_netdev_flow *netdev_flow, int cnt, int size,
                     uint16_t tcp_flags, long long now)
@@ -7475,6 +8568,8 @@ dp_netdev_flow_used(struct dp_netdev_flow *netdev_flow, int cnt, int size,
     atomic_store_relaxed(&netdev_flow->stats.tcp_flags, flags);
 }
 
+/* 触发 upcall：将未匹配的报文上送到 vswitchd 的 upcall 处理器。
+ * upcall 处理器会执行 OpenFlow 流表查找并返回 actions。 */
 static int
 dp_netdev_upcall(struct dp_netdev_pmd_thread *pmd, struct dp_packet *packet_,
                  struct flow *flow, struct flow_wildcards *wc, ovs_u128 *ufid,
@@ -7520,6 +8615,19 @@ dp_netdev_upcall(struct dp_netdev_pmd_thread *pmd, struct dp_packet *packet_,
                          actions, wc, put_actions, dp->upcall_aux);
 }
 
+/* =====================================================
+ * 数据面报文处理核心（dp_netdev_input 调用链）。
+ *
+ * 报文处理的完整流程：
+ * 1. miniflow_extract: 从报文头提取字段到 miniflow key
+ * 2. EMC 精确匹配缓存查找（hash + memcmp）
+ * 3. SMC 签名匹配缓存查找（16位签名 + 规则验证）
+ * 4. dpcls 通配符分类器查找（遍历子表批量匹配）
+ * 5. upcall 慢路径（发送到 vswitchd 做 OpenFlow 匹配）
+ * 6. 按流批量执行 actions
+ * ===================================================== */
+
+/* 获取或计算报文的 RSS hash，考虑 recirculation 深度。 */
 static inline uint32_t
 dpif_netdev_packet_get_rss_hash(struct dp_packet *packet,
                                 const struct miniflow *mf)
@@ -7542,12 +8650,12 @@ dpif_netdev_packet_get_rss_hash(struct dp_packet *packet,
     return hash;
 }
 
+/* 按流分组的报文批次：将匹配同一条流的报文聚合在一起，一次性执行 actions。 */
 struct packet_batch_per_flow {
-    unsigned int byte_count;
-    uint16_t tcp_flags;
-    struct dp_netdev_flow *flow;
-
-    struct dp_packet_batch array;
+    unsigned int byte_count;    /* 累计字节数 */
+    uint16_t tcp_flags;         /* 合并的 TCP 标志 */
+    struct dp_netdev_flow *flow; /* 关联的流 */
+    struct dp_packet_batch array; /* 报文数组 */
 };
 
 static inline void
@@ -7572,6 +8680,15 @@ packet_batch_per_flow_init(struct packet_batch_per_flow *batch,
     batch->tcp_flags = 0;
 }
 
+/* 执行一个 per-flow 批次 — 数据包处理流水线的最后一步。
+ *
+ * 将同一条流的所有数据包一次性执行 action，步骤：
+ * 1. 更新流的使用统计（包数、字节数、TCP 标志、最后使用时间）
+ * 2. 通过 RCU 获取流的 actions（可能被 revalidator 并发更新）
+ * 3. 调用 dp_netdev_execute_actions() 执行所有 action
+ *
+ * should_steal = true：执行完后 actions 负责释放数据包内存，
+ * 调用者不再持有这些包的所有权。 */
 static inline void
 packet_batch_per_flow_execute(struct packet_batch_per_flow *batch,
                               struct dp_netdev_pmd_thread *pmd)
@@ -7579,16 +8696,42 @@ packet_batch_per_flow_execute(struct packet_batch_per_flow *batch,
     struct dp_netdev_actions *actions;
     struct dp_netdev_flow *flow = batch->flow;
 
+    /* 步骤 1：更新流的使用统计。
+     * 这些统计可通过 ovs-appctl dpctl/dump-flows 查看：
+     *   - packets: 累计包数
+     *   - bytes:   累计字节数
+     *   - tcp_flags: 聚合的 TCP 标志位（用于 revalidator 判断连接状态）
+     *   - used:    最后使用时间戳（毫秒，用于流过期判断） */
     dp_netdev_flow_used(flow, dp_packet_batch_size(&batch->array),
                         batch->byte_count,
                         batch->tcp_flags, pmd->ctx.now / 1000);
 
+    /* 步骤 2：获取流的 actions（RCU 保护读取）。
+     * actions 可能被 revalidator 线程通过 flow_put 更新，
+     * 这里用 ovsrcu_get 保证读到一致的版本。 */
     actions = dp_netdev_flow_get_actions(flow);
 
+    /* @veencn_260223: 记录 action 执行延迟和端到端总延迟 */
+    LATENCY(pmd, BEGIN, t_action_start);
+
+    /* 步骤 3：执行 actions。
+     * 内部调用 odp_execute_actions()，遍历 action 列表，
+     * 对每个 action 调用 dp_execute_cb() 回调：
+     *   OUTPUT → 发送到端口
+     *   SET/SET_MASKED → 修改包头
+     *   CT → conntrack 处理
+     *   RECIRC → 重新进入 dp_netdev_input__()
+     *   等等...
+     * should_steal=true：action 执行后自动释放包内存 */
     dp_netdev_execute_actions(pmd, &batch->array, true, &flow->flow,
                               actions->actions, actions->size);
+
+    LATENCY(pmd, END, t_action_start, action_exec,
+            latency_batch_total(&pmd->latency_stats,
+                                &batch->array, _lend));
 }
 
+/* 直接执行批量报文的 actions（SIMD 优化路径使用）。 */
 void
 dp_netdev_batch_execute(struct dp_netdev_pmd_thread *pmd,
                         struct dp_packet_batch *packets,
@@ -7607,6 +8750,7 @@ dp_netdev_batch_execute(struct dp_netdev_pmd_thread *pmd,
                               actions->actions, actions->size);
 }
 
+/* 将报文加入对应流的批次。若该流还没有批次则创建新批次。 */
 static inline void
 dp_netdev_queue_batches(struct dp_packet *pkt,
                         struct dp_netdev_flow *flow, uint16_t tcp_flags,
@@ -7623,6 +8767,7 @@ dp_netdev_queue_batches(struct dp_packet *pkt,
     packet_batch_per_flow_update(batch, pkt, tcp_flags);
 }
 
+/* 将报文记录到 flow_map 数组中（用于 SMC 查找后的批量处理）。 */
 static inline void
 packet_enqueue_to_flow_map(struct dp_packet *packet,
                            struct dp_netdev_flow *flow,
@@ -7640,6 +8785,8 @@ packet_enqueue_to_flow_map(struct dp_packet *packet,
  * By doing batching SMC lookup, we can use prefetch
  * to hide memory access latency.
  */
+/* SMC 批量查找：先 prefetch 所有桶位，再逐个匹配签名和规则。
+ * 命中的报文加入 flow_map，未命中的留在 packets_ 中传给 dpcls。 */
 static inline void
 smc_lookup_batch(struct dp_netdev_pmd_thread *pmd,
             struct netdev_flow_key *keys,
@@ -7678,6 +8825,10 @@ smc_lookup_batch(struct dp_netdev_pmd_thread *pmd,
                 flow->flow.in_port.odp_port == packet->md.in_port.odp_port)) {
                     tcp_flags = miniflow_get_tcp_flags(&keys[i].mf);
 
+                    /* @veencn_260223: SMC hit - record lookup latency. */
+                    LATENCY(pmd, MARK, packet, smc_lookup,
+                            pmd->latency_stats.smc_hit_count++);
+
                     /* SMC hit and emc miss, we insert into EMC */
                     keys[i].len =
                         netdev_flow_key_size(miniflow_n_values(&keys[i].mf));
@@ -7711,6 +8862,10 @@ smc_lookup_batch(struct dp_netdev_pmd_thread *pmd,
     pmd_perf_update_counter(&pmd->perf_stats, PMD_STAT_SMC_HIT, n_smc_hit);
 }
 
+/* 单包 SMC 查找 — 用于非批量场景。
+ * 通过 key 的哈希在 SMC 中定位 flow_node，然后逐个检查
+ * dpcls_rule 是否匹配 key 且入端口一致。
+ * SMC 没有 per-port megaflow，因此必须额外验证入端口。 */
 struct dp_netdev_flow *
 smc_lookup_single(struct dp_netdev_pmd_thread *pmd,
                   struct dp_packet *packet,
@@ -7735,39 +8890,67 @@ smc_lookup_single(struct dp_netdev_pmd_thread *pmd,
     return NULL;
 }
 
+/* 硬件卸载流查找（PHWOL post-process）。
+ *
+ * 背景：智能网卡（如 Mellanox/NVIDIA ConnectX）可以在硬件中完成流表匹配。
+ * 网卡收包时已经知道此包匹配哪条流规则，将匹配结果（flow 指针）附在包的
+ * 元数据中。软件只需调用 post-process API 取出这个引用即可，跳过所有
+ * 软件层面的 miniflow 提取和 EMC/SMC/dpcls 查找。
+ *
+ * 返回值语义：
+ *   返回 0,  *flow != NULL → 硬件命中，直接使用此 flow
+ *   返回 0,  *flow == NULL → 硬件未匹配（或不支持），走软件路径
+ *   返回 -1              → 硬件处理出错，数据包应被丢弃 */
 inline int
 dp_netdev_hw_flow(const struct dp_netdev_pmd_thread *pmd,
                   struct dp_packet *packet,
                   struct dp_netdev_flow **flow)
 {
+    /* 获取当前正在处理的 RXQ（由 dp_netdev_process_rxq_port 设置） */
     struct dp_netdev_rxq *rxq = pmd->ctx.last_rxq;
     bool post_process_api_supported;
     void *flow_reference = NULL;
     int err;
 
+    /* 检查此端口的网卡是否支持 post-process API。
+     * 使用 relaxed 原子读取（性能敏感的热路径，不需要内存屏障）。 */
     atomic_read_relaxed(&rxq->port->netdev->hw_info.post_process_api_supported,
                         &post_process_api_supported);
 
+    /* 不支持 → 返回 0 + flow=NULL，调用者继续走软件查找路径 */
     if (!post_process_api_supported) {
         *flow = NULL;
         return 0;
     }
 
+    /* 调用硬件 post-process API：
+     * 从数据包元数据中提取网卡在硬件流表中匹配到的 flow 引用。
+     * 成功时 flow_reference 指向已卸载的 dp_netdev_flow。 */
     err = dpif_offload_netdev_hw_post_process(rxq->port->netdev, pmd->core_id,
                                               packet, &flow_reference);
     if (err && err != EOPNOTSUPP) {
+        /* 硬件处理出错 — 数据包不可用，需要丢弃 */
         if (err != ECANCELED) {
+            /* 一般错误（如硬件流表过期、元数据损坏） */
             COVERAGE_INC(datapath_drop_hw_post_process);
         } else {
+            /* ECANCELED：包已被硬件完全消费（如发送到硬件队列），
+             * 软件不应再处理此包 */
             COVERAGE_INC(datapath_drop_hw_post_process_consumed);
         }
         return -1;
     }
 
+    /* EOPNOTSUPP：硬件不支持此包的 post-process（flow_reference=NULL）
+     * 成功：flow_reference 指向匹配的流（可能为 NULL 表示未命中） */
     *flow = flow_reference;
     return 0;
 }
 
+/* 将已分类的数据包加入 per-flow 批次或 flow_map。
+ * batch_enable=true 时直接加入 batches（可以立即执行 action）；
+ * batch_enable=false 时加入 flow_map 延迟处理（保持包序，
+ * 因为 EMC 未命中的包还需要 fast_path_processing）。 */
 /* Enqueues already classified packet into per-flow batches or the flow map,
  * depending on the fact if batching enabled. */
 static inline void
@@ -7795,6 +8978,21 @@ dfc_processing_enqueue_classified_packet(struct dp_packet *packet,
 
 }
 
+/* DFC（Datapath Flow Cache）处理 — 数据包的第一轮流表查找。
+ *
+ * 对收到的一批数据包依次尝试以下查找路径：
+ * 1. 硬件卸载（PHWOL）：网卡已匹配的流，直接使用
+ * 2. Simple Match：仅按 in_port/dl_type/nw_frag/vlan_tci 查找全流表
+ * 3. EMC（Exact Match Cache）：通过 miniflow 提取的 key 在精确匹配缓存中查找
+ * 4. SMC（Signature Match Cache）：EMC 未命中时，对未命中包做批量 SMC 查找
+ *
+ * 命中的包直接加入 batches 或 flow_map 等待执行 action。
+ * 未命中的包被压缩到 packets 数组头部，返回给调用者进入 fast_path_processing（dpcls 查找）。
+ *
+ * 关键优化：
+ * - Prefetch 下一个包的 data 和 metadata
+ * - batch_enable 标志：一旦出现 EMC miss，后续包都进 flow_map 保序
+ * - 统计计数器：PHWOL_HIT, SIMPLE_HIT, EXACT_HIT 等 */
 /* Try to process all ('cnt') the 'packets' using only the datapath flow cache
  * 'pmd->flow_cache'. If a flow is not found for a packet 'packets[i]', the
  * miniflow is copied into 'keys' and the packet pointer is moved at the
@@ -7812,66 +9010,80 @@ dfc_processing_enqueue_classified_packet(struct dp_packet *packet,
  */
 static inline size_t
 dfc_processing(struct dp_netdev_pmd_thread *pmd,
-               struct dp_packet_batch *packets_,
-               struct netdev_flow_key *keys,
-               struct netdev_flow_key **missed_keys,
+               struct dp_packet_batch *packets_,  /* 输入/输出：未命中的包被压到头部 */
+               struct netdev_flow_key *keys,       /* 输出：每个包提取的 miniflow key */
+               struct netdev_flow_key **missed_keys, /* 输出：EMC+SMC 都未命中的 key 指针 */
                struct packet_batch_per_flow batches[], size_t *n_batches,
-               struct dp_packet_flow_map *flow_map,
-               size_t *n_flows, uint8_t *index_map,
+               struct dp_packet_flow_map *flow_map,  /* 输出：包→流映射（保序用） */
+               size_t *n_flows, uint8_t *index_map,  /* 输出：miss 包在 flow_map 中的位置 */
                bool md_is_valid, odp_port_t port_no)
 {
-    const bool offload_enabled = dpif_offload_enabled();
-    const uint32_t recirc_depth = *recirc_depth_get();
-    const size_t cnt = dp_packet_batch_size(packets_);
-    size_t n_missed = 0, n_emc_hit = 0, n_phwol_hit = 0;
+    const bool offload_enabled = dpif_offload_enabled();   /* 硬件卸载是否启用 */
+    const uint32_t recirc_depth = *recirc_depth_get();     /* 当前 recirculation 深度 */
+    const size_t cnt = dp_packet_batch_size(packets_);     /* 本批包的总数 */
+    size_t n_missed = 0, n_emc_hit = 0, n_phwol_hit = 0;  /* 各路径命中计数 */
     size_t n_mfex_opt_hit = 0, n_simple_hit = 0;
-    struct dfc_cache *cache = &pmd->flow_cache;
-    struct netdev_flow_key *key = &keys[0];
+    struct dfc_cache *cache = &pmd->flow_cache;   /* EMC + SMC 缓存 */
+    struct netdev_flow_key *key = &keys[0];        /* 当前包使用的 key 槽位 */
     struct dp_packet *packet;
-    size_t map_cnt = 0;
-    bool batch_enable = true;
+    size_t map_cnt = 0;          /* flow_map 的当前写入位置 */
+    bool batch_enable = true;    /* 是否直接加入 batches（false 时进 flow_map 保序） */
 
+    /* Simple Match 优化：仅在非 recirc 包且端口启用时可用。
+     * simple_match_table 是完整流表（非缓存），未命中就必须 upcall，
+     * 因此启用 simple match 时不需要 EMC/SMC。 */
     const bool simple_match_enabled =
         !md_is_valid && dp_netdev_simple_match_enabled(pmd, port_no);
-    /* 'simple_match_table' is a full flow table.  If the flow is not there,
-     * upcall is required, and there is no chance to find a match in caches. */
+    /* SMC 仅在未启用 simple match 且全局配置开启时生效 */
     const bool smc_enable_db = !simple_match_enabled && pmd->ctx.smc_enable_db;
+    /* EMC 插入阈值：simple match 模式下设为 0（禁用 EMC 查找） */
     const uint32_t cur_min = simple_match_enabled
                              ? 0 : pmd->ctx.emc_insert_min;
 
+    /* 统计本批包数：recirc 包计入 RECIRC，新收包计入 RECV */
     pmd_perf_update_counter(&pmd->perf_stats,
                             md_is_valid ? PMD_STAT_RECIRC : PMD_STAT_RECV,
                             cnt);
+
+    /* === 主循环：逐包尝试各级查找 ===
+     * 使用 DP_PACKET_BATCH_REFILL_FOR_EACH 宏：
+     * 边遍历边"重填"—— 未命中的包被压缩到 packets_ 数组头部，
+     * 命中的包被跳过（不放回），最终 packets_ 中只剩未命中的包。 */
     int i;
     DP_PACKET_BATCH_REFILL_FOR_EACH (i, cnt, packet, packets_) {
         struct dp_netdev_flow *flow = NULL;
         uint16_t tcp_flags;
 
+        /* 丢弃过小的包（连以太网头都不够） */
         if (OVS_UNLIKELY(dp_packet_size(packet) < ETH_HEADER_LEN)) {
             dp_packet_delete(packet);
             COVERAGE_INC(datapath_drop_rx_invalid_packet);
             continue;
         }
 
+        /* 预取下一个包的数据和 metadata 到 L1 cache。
+         * 利用当前包的处理时间来隐藏下一个包的内存访问延迟。 */
         if (i != cnt - 1) {
             struct dp_packet **packets = packets_->packets;
-            /* Prefetch next packet data and metadata. */
             OVS_PREFETCH(dp_packet_data(packets[i+1]));
             pkt_metadata_prefetch_init(&packets[i+1]->md);
         }
 
+        /* 首次从端口收包（非 recirc），需要初始化 metadata（设置 in_port） */
         if (!md_is_valid) {
             pkt_metadata_init(&packet->md, port_no);
         }
 
+        /* --- 查找路径 1：硬件卸载（PHWOL）---
+         * 仅在首次收包（recirc_depth==0）且启用卸载时尝试。
+         * 网卡硬件已匹配的包直接返回 flow 引用，跳过所有软件查找。 */
         if (offload_enabled && recirc_depth == 0) {
             if (OVS_UNLIKELY(dp_netdev_hw_flow(pmd, packet, &flow))) {
-                /* Packet restoration failed and it was dropped, do not
-                 * continue processing.
-                 */
+                /* 硬件 post-process 失败，包已被丢弃 */
                 continue;
             }
             if (OVS_LIKELY(flow)) {
+                /* 硬件命中：解析 TCP 标志后直接入队 */
                 tcp_flags = parse_tcp_flags(packet, NULL, NULL, NULL);
                 n_phwol_hit++;
                 dfc_processing_enqueue_classified_packet(
@@ -7881,6 +9093,10 @@ dfc_processing(struct dp_netdev_pmd_thread *pmd,
             }
         }
 
+        /* --- 查找路径 2：Simple Match ---
+         * 仅按 in_port + dl_type + nw_frag + vlan_tci 四个字段查找。
+         * 不需要 miniflow_extract()，非常快。
+         * 适用于流规则较少且匹配字段简单的场景。 */
         if (!flow && simple_match_enabled) {
             ovs_be16 dl_type = 0, vlan_tci = 0;
             uint8_t nw_frag = 0;
@@ -7897,45 +9113,67 @@ dfc_processing(struct dp_netdev_pmd_thread *pmd,
             }
         }
 
+        /* --- PHWOL 和 Simple Match 都未命中，进入 miniflow 路径 --- */
+
+        /* 从数据包提取 miniflow（解析 L2/L3/L4 头部字段）。
+         * 这是 CPU 密集型操作（约 50-100 个周期/包）。 */
         miniflow_extract(packet, &key->mf);
-        key->len = 0; /* Not computed yet. */
+        key->len = 0; /* 长度稍后由 fast_path_processing 计算 */
+        /* 计算 key 的哈希值。
+         * 非 recirc 包优先使用网卡提供的 RSS hash（避免重新计算）；
+         * recirc 包的 RSS hash 可能已被修改，需要重新计算。 */
         key->hash =
                 (md_is_valid == false)
                 ? dpif_netdev_packet_get_rss_hash_orig_pkt(packet, &key->mf)
                 : dpif_netdev_packet_get_rss_hash(packet, &key->mf);
 
-        /* If EMC is disabled skip emc_lookup */
+        /* @veencn_260223: 记录 miniflow 提取延迟 */
+        LATENCY(pmd, MARK, packet, miniflow);
+
+        /* --- 查找路径 3：EMC（Exact Match Cache）---
+         * cur_min > 0 时才查找（cur_min==0 表示 EMC 被禁用）。
+         * EMC 是 per-PMD 的精确匹配哈希表，命中率最高时约 90%+。 */
         flow = (cur_min != 0) ? emc_lookup(&cache->emc_cache, key) : NULL;
         if (OVS_LIKELY(flow)) {
+            /* EMC 命中 — 最快的软件路径 */
+            /* @veencn_260223: 记录 EMC 命中延迟 */
+            LATENCY(pmd, MARK, packet, emc_lookup,
+                    pmd->latency_stats.emc_hit_count++);
             tcp_flags = miniflow_get_tcp_flags(&key->mf);
             n_emc_hit++;
             dfc_processing_enqueue_classified_packet(
                     packet, flow, tcp_flags, batch_enable,
                     batches, n_batches, flow_map, &map_cnt);
         } else {
-            /* Exact match cache missed. Group missed packets together at
-             * the beginning of the 'packets' array. */
+            /* --- EMC 未命中 --- */
+
+            /* 将未命中的包"重填"到 packets_ 数组头部。
+             * 最终 packets_ 只包含 EMC 未命中的包，传给 fast_path_processing。 */
             dp_packet_batch_refill(packets_, packet, i);
 
-            /* Preserve the order of packet for flow batching. */
+            /* 在 flow_map 中为此包预留位置（flow=NULL 标记未分类）。
+             * index_map 记录此 miss 包在 flow_map 中的原始位置，
+             * 后续 fast_path_processing 命中后通过 index_map 回填。 */
             index_map[n_missed] = map_cnt;
             flow_map[map_cnt++].flow = NULL;
 
-            /* 'key[n_missed]' contains the key of the current packet and it
-             * will be passed to SMC lookup. The next key should be extracted
-             * to 'keys[n_missed + 1]'.
-             * We also maintain a pointer array to keys missed both SMC and EMC
-             * which will be returned to the caller for future processing. */
+            /* 当前 key（keys[n_missed]）已填充了此包的 miniflow，
+             * 保存到 missed_keys 指针数组供后续 SMC/dpcls 查找使用。
+             * 将 key 指针前进到下一个槽位，准备给下一个包使用。 */
             missed_keys[n_missed] = key;
             key = &keys[++n_missed];
 
-            /* Skip batching for subsequent packets to avoid reordering. */
+            /* 关键保序逻辑：一旦出现 EMC miss，后续所有包都进 flow_map
+             * 而不是直接加入 batches。这样可以避免命中包"插队"到
+             * 未命中包前面，导致同一条流的包乱序。 */
             batch_enable = false;
         }
     }
-    /* Count of packets which are not flow batched. */
+
+    /* flow_map 中的条目总数（包括命中和未命中的） */
     *n_flows = map_cnt;
 
+    /* 更新各路径的命中统计 */
     pmd_perf_update_counter(&pmd->perf_stats, PMD_STAT_PHWOL_HIT, n_phwol_hit);
     pmd_perf_update_counter(&pmd->perf_stats, PMD_STAT_MFEX_OPT_HIT,
                             n_mfex_opt_hit);
@@ -7943,17 +9181,28 @@ dfc_processing(struct dp_netdev_pmd_thread *pmd,
                             n_simple_hit);
     pmd_perf_update_counter(&pmd->perf_stats, PMD_STAT_EXACT_HIT, n_emc_hit);
 
+    /* --- 查找路径 4：SMC（Signature Match Cache）---
+     * 仅在 SMC 启用且非 simple match 模式时执行。
+     * 对所有 EMC 未命中的包做批量 SMC 查找。
+     * SMC 命中的包会从 packets_ 中移除，剩余的继续给 dpcls。 */
     if (!smc_enable_db) {
         return dp_packet_batch_size(packets_);
     }
 
-    /* Packets miss EMC will do a batch lookup in SMC if enabled */
     smc_lookup_batch(pmd, keys, missed_keys, packets_,
                      n_missed, flow_map, index_map);
 
+    /* 返回最终仍未命中的包数（这些包需要进入 fast_path_processing） */
     return dp_packet_batch_size(packets_);
 }
 
+/* 处理未命中流表的数据包（upcall）。
+ * 流程：
+ * 1. 从 miniflow 展开为 match
+ * 2. 调用 upcall 回调（发送到 vswitchd 进行 OpenFlow 查表）
+ * 3. 使用返回的 action 执行数据包处理
+ * 4. 将新流表规则安装到 dpcls/EMC/SMC 中（避免后续包再次 upcall）
+ * upcall 是慢路径，性能开销大，应尽量减少。 */
 static inline int
 handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
                      struct dp_packet *packet,
@@ -8034,6 +9283,25 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
     return error;
 }
 
+/* 快速路径处理 — 对 EMC/SMC 未命中的数据包进行 dpcls（megaflow）查找。
+ *
+ * 这是流表查找的第三级（也是最慢的软件级），前两级是 EMC 和 SMC。
+ * 整体分为四个阶段：
+ *
+ * 阶段 1：dpcls 批量查找
+ *   → 按 in_port 找到对应的 dpcls 分类器
+ *   → 批量查找所有 key，结果存入 rules[] 数组
+ *
+ * 阶段 2：upcall 处理（仅有 miss 时）
+ *   → 获取 upcall 读锁
+ *   → 对每个未命中的包调用 handle_packet_upcall() 走慢路径
+ *   → upcall 会安装新的 megaflow 规则到 dpcls
+ *
+ * 阶段 3：回填缓存 + 加入 flow_map
+ *   → 命中的包回填 EMC 和 SMC（加速后续相同流的查找）
+ *   → 按原始接收顺序加入 flow_map（保序）
+ *
+ * 阶段 4：更新统计计数器 */
 static inline void
 fast_path_processing(struct dp_netdev_pmd_thread *pmd,
                      struct dp_packet_batch *packets_,
@@ -8042,7 +9310,7 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
                      uint8_t *index_map,
                      odp_port_t in_port)
 {
-    const size_t cnt = dp_packet_batch_size(packets_);
+    const size_t cnt = dp_packet_batch_size(packets_);  /* EMC/SMC 未命中的包数 */
 #if !defined(__CHECKER__) && !defined(_WIN32)
     const size_t PKT_ARRAY_SIZE = cnt;
 #else
@@ -8051,26 +9319,48 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
 #endif
     struct dp_packet *packet;
     struct dpcls *cls;
-    struct dpcls_rule *rules[PKT_ARRAY_SIZE];
+    struct dpcls_rule *rules[PKT_ARRAY_SIZE];  /* 查找结果：每个包对应的 rule（NULL=miss） */
     struct dp_netdev *dp = pmd->dp;
-    int upcall_ok_cnt = 0, upcall_fail_cnt = 0;
-    int lookup_cnt = 0, add_lookup_cnt;
-    bool any_miss;
+    int upcall_ok_cnt = 0, upcall_fail_cnt = 0;  /* upcall 成功/失败计数 */
+    int lookup_cnt = 0, add_lookup_cnt;  /* 子表查找总次数（用于统计） */
+    bool any_miss;  /* 是否有包未命中 dpcls */
 
+    /* === 阶段 1：dpcls 批量查找 === */
+
+    /* 计算每个 key 的长度（dpcls_lookup 需要）。
+     * 长度取决于 miniflow 中非零 unit 的数量。
+     * hash 在 dpcls_lookup 内部按需计算。 */
     for (size_t i = 0; i < cnt; i++) {
-        /* Key length is needed in all the cases, hash computed on demand. */
         keys[i]->len = netdev_flow_key_size(miniflow_n_values(&keys[i]->mf));
     }
-    /* Get the classifier for the in_port */
+
+    /* 按入端口找到对应的 dpcls 分类器。
+     * 每个入端口有独立的 dpcls，这样不同端口的流规则互不干扰。 */
     cls = dp_netdev_pmd_lookup_dpcls(pmd, in_port);
     if (OVS_LIKELY(cls)) {
+        /* 批量查找：将 cnt 个 key 同时在所有子表中查找。
+         * rules[i] 指向命中的 dpcls_rule，未命中则为 NULL。
+         * lookup_cnt 累加遍历的子表数（用于 MASKED_LOOKUP 统计）。
+         * 返回 true 表示全部命中，false 表示存在 miss。 */
         any_miss = !dpcls_lookup(cls, (const struct netdev_flow_key **)keys,
                                 rules, cnt, &lookup_cnt);
     } else {
+        /* 该入端口没有分类器（新端口，还没有任何流规则），全部 miss */
         any_miss = true;
         memset(rules, 0, sizeof(rules));
     }
+
+    /* @veencn_260223: 记录 dpcls 命中包的查找延迟 */
+    LATENCY(pmd, MARK_BATCH, packets_, dpcls_lookup,
+            dpcls_hit_count, rules);
+
+    /* === 阶段 2：upcall 处理（慢路径）===
+     * 仅在有 miss 且能获取 upcall 读锁时进入。
+     * upcall_rwlock 是读写锁：
+     *   - PMD 线程取读锁（允许并发 upcall）
+     *   - disable_upcall() 取写锁（阻止所有 upcall，用于 datapath 重配置） */
     if (OVS_UNLIKELY(any_miss) && !fat_rwlock_tryrdlock(&dp->upcall_rwlock)) {
+        /* 使用栈上 stub 缓冲区避免 malloc（512 字节通常够用，超出会自动扩展） */
         uint64_t actions_stub[512 / 8], slow_stub[512 / 8];
         struct ofpbuf actions, put_actions;
 
@@ -8080,13 +9370,14 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
         DP_PACKET_BATCH_FOR_EACH (i, packet, packets_) {
             struct dp_netdev_flow *netdev_flow;
 
+            /* 已命中的包跳过 */
             if (OVS_LIKELY(rules[i])) {
                 continue;
             }
 
-            /* It's possible that an earlier slow path execution installed
-             * a rule covering this flow.  In this case, it's a lot cheaper
-             * to catch it here than execute a miss. */
+            /* 在执行昂贵的 upcall 之前，先再查一次流表。
+             * 原因：同一批次中前面的包可能已经触发 upcall 并安装了新规则，
+             * 后面的同类包就可以直接命中，避免重复 upcall。 */
             netdev_flow = dp_netdev_pmd_lookup_flow(pmd, keys[i],
                                                     &add_lookup_cnt);
             if (netdev_flow) {
@@ -8095,8 +9386,20 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
                 continue;
             }
 
+            /* @veencn_260223: 记录 upcall 延迟 */
+            LATENCY(pmd, BEGIN, t_upcall_start);
+
+            /* 核心 upcall 调用：
+             * 1. 将包发送到 ofproto（OpenFlow 查表）
+             * 2. 用返回的 action 执行数据包
+             * 3. 将新的 megaflow 规则安装到 dpcls + EMC + SMC
+             * 注意：upcall 会直接执行该包的 action，
+             *       所以 upcall 的包不会再进入下面的 flow_map 流程 */
             int error = handle_packet_upcall(pmd, packet, keys[i],
                                              &actions, &put_actions);
+
+            LATENCY(pmd, END, t_upcall_start, upcall,
+                    pmd->latency_stats.upcall_count++);
 
             if (OVS_UNLIKELY(error)) {
                 upcall_fail_cnt++;
@@ -8109,6 +9412,8 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
         ofpbuf_uninit(&put_actions);
         fat_rwlock_unlock(&dp->upcall_rwlock);
     } else if (OVS_UNLIKELY(any_miss)) {
+        /* upcall 读锁获取失败（说明正在 disable_upcall，即 datapath 重配置中）。
+         * 无法执行 upcall，只能丢弃未命中的包。 */
         DP_PACKET_BATCH_FOR_EACH (i, packet, packets_) {
             if (OVS_UNLIKELY(!rules[i])) {
                 dp_packet_delete(packet);
@@ -8118,39 +9423,62 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
         }
     }
 
+    /* === 阶段 3：回填缓存 + 加入 flow_map ===
+     * 对 dpcls 命中的包（rules[i] != NULL），做两件事：
+     * 1. 回填 EMC 和 SMC — 下次相同流的包可以在更快的缓存中命中
+     * 2. 按原始接收顺序（index_map）加入 flow_map — 保证包序不乱 */
     DP_PACKET_BATCH_FOR_EACH (i, packet, packets_) {
         struct dp_netdev_flow *flow;
-        /* Get the original order of this packet in received batch. */
+        /* 从 index_map 获取此包在原始收包批次中的位置 */
         int recv_idx = index_map[i];
         uint16_t tcp_flags;
 
+        /* 跳过 upcall 处理过的包（rules[i] 已被清空）和丢弃的包 */
         if (OVS_UNLIKELY(!rules[i])) {
             continue;
         }
 
         flow = dp_netdev_flow_cast(rules[i]);
+
+        /* 回填 SMC：用 flow 的 ufid hash 作为 SMC 的签名 */
         uint32_t hash =  dp_netdev_flow_hash(&flow->ufid);
         smc_insert(pmd, keys[i], hash);
 
+        /* 回填 EMC：概率性插入（不是每个包都插入，避免 EMC 抖动） */
         emc_probabilistic_insert(pmd, keys[i], flow);
-        /* Add these packets into the flow map in the same order
-         * as received.
-         */
+
+        /* 将包加入 flow_map，使用原始接收顺序（recv_idx）保持包序。
+         * 后续在 dp_netdev_input__ 中会将 flow_map 合并到 batches 批量执行。 */
         tcp_flags = miniflow_get_tcp_flags(&keys[i]->mf);
         packet_enqueue_to_flow_map(packet, flow, tcp_flags,
                                    flow_map, recv_idx);
     }
 
+    /* === 阶段 4：更新性能统计 === */
+    /* MASKED_HIT = dpcls 命中数（总包数 - upcall 成功 - upcall 失败） */
     pmd_perf_update_counter(&pmd->perf_stats, PMD_STAT_MASKED_HIT,
                             cnt - upcall_ok_cnt - upcall_fail_cnt);
+    /* MASKED_LOOKUP = dpcls 中遍历的子表总数（越少越好，说明热点子表排在前面） */
     pmd_perf_update_counter(&pmd->perf_stats, PMD_STAT_MASKED_LOOKUP,
                             lookup_cnt);
+    /* MISS = upcall 成功数（新流的首包） */
     pmd_perf_update_counter(&pmd->perf_stats, PMD_STAT_MISS,
                             upcall_ok_cnt);
+    /* LOST = upcall 失败数（丢弃的包） */
     pmd_perf_update_counter(&pmd->perf_stats, PMD_STAT_LOST,
                             upcall_fail_cnt);
 }
 
+/* 数据包进入数据路径的核心处理函数。
+ * 数据包从端口接收或 recirculation 重入时都会调用此函数。
+ *
+ * 整体流程（三级流水线）：
+ * 1. dfc_processing()   — 一级/二级缓存查找（PHWOL → Simple → EMC → SMC）
+ * 2. fast_path_processing() — 三级分类器查找（dpcls），未命中则 upcall
+ * 3. 合并所有 flow_map 条目到 batches，批量执行 action
+ *
+ * md_is_valid=false：首次从端口收包，需要用 port_no 初始化 metadata。
+ * md_is_valid=true：recirculation 包，metadata 已由前一轮设置好。 */
 /* Packets enter the datapath from a port (or from recirculation) here.
  *
  * When 'md_is_valid' is true the metadata in 'packets' are already valid.
@@ -8166,29 +9494,39 @@ dp_netdev_input__(struct dp_netdev_pmd_thread *pmd,
     /* Sparse or MSVC doesn't like variable length array. */
     enum { PKT_ARRAY_SIZE = NETDEV_MAX_BURST };
 #endif
+    /* keys[]：每个包的 miniflow key（cache-line 对齐以提升访问性能） */
     OVS_ALIGNED_VAR(CACHE_LINE_SIZE)
         struct netdev_flow_key keys[PKT_ARRAY_SIZE];
+    /* missed_keys[]：EMC/SMC 都未命中的 key 指针，传给 fast_path_processing */
     struct netdev_flow_key *missed_keys[PKT_ARRAY_SIZE];
+    /* batches[]：per-flow 的包批次，同一流的包聚合后一起执行 action */
     struct packet_batch_per_flow batches[PKT_ARRAY_SIZE];
     size_t n_batches;
+    /* flow_map[]：记录包到 flow 的映射关系（保持原始接收顺序） */
     struct dp_packet_flow_map flow_map[PKT_ARRAY_SIZE];
+    /* index_map[]：EMC miss 的包在 flow_map 中的原始位置索引 */
     uint8_t index_map[PKT_ARRAY_SIZE];
     size_t n_flows, i;
 
     odp_port_t in_port;
 
+    /* 第一步：DFC 处理 — 尝试 EMC/SMC 缓存查找。
+     * 命中的包直接加入 batches 或 flow_map；
+     * 未命中的包被压缩到 packets 数组头部（返回值为未命中数）。 */
     n_batches = 0;
     dfc_processing(pmd, packets, keys, missed_keys, batches, &n_batches,
                    flow_map, &n_flows, index_map, md_is_valid, port_no);
 
+    /* 第二步：EMC/SMC 未命中的包走 dpcls 通配符分类器查找。
+     * 仍未命中则 upcall 到 vswitchd 进行 OpenFlow 查表。 */
     if (!dp_packet_batch_is_empty(packets)) {
-        /* Get ingress port from first packet's metadata. */
         in_port = packets->packets[0]->md.in_port.odp_port;
         fast_path_processing(pmd, packets, missed_keys,
                              flow_map, index_map, in_port);
     }
 
-    /* Batch rest of packets which are in flow map. */
+    /* 第三步：将 flow_map 中延迟的包合并到 per-flow batches。
+     * 这些包在 dfc_processing 中因为需要保序而未直接加入 batches。 */
     for (i = 0; i < n_flows; i++) {
         struct dp_packet_flow_map *map = &flow_map[i];
 
@@ -8199,24 +9537,23 @@ dp_netdev_input__(struct dp_netdev_pmd_thread *pmd,
                                 batches, &n_batches);
      }
 
-    /* All the flow batches need to be reset before any call to
-     * packet_batch_per_flow_execute() as it could potentially trigger
-     * recirculation. When a packet matching flow 'j' happens to be
-     * recirculated, the nested call to dp_netdev_input__() could potentially
-     * classify the packet as matching another flow - say 'k'. It could happen
-     * that in the previous call to dp_netdev_input__() that same flow 'k' had
-     * already its own batches[k] still waiting to be served.  So if its
-     * 'batch' member is not reset, the recirculated packet would be wrongly
-     * appended to batches[k] of the 1st call to dp_netdev_input__(). */
+    /* 第四步：清除所有 flow 的 batch 指针。
+     * 必须在执行 action 前完成，因为 action 可能触发 recirculation，
+     * 导致递归调用 dp_netdev_input__()。如果不清除，recirculation 中
+     * 匹配到同一 flow 的包会错误地追加到外层调用的 batch 中。 */
     for (i = 0; i < n_batches; i++) {
         batches[i].flow->batch = NULL;
     }
 
+    /* 第五步：批量执行每个 flow 的 action（发送、修改、隧道封装等）。 */
     for (i = 0; i < n_batches; i++) {
         packet_batch_per_flow_execute(&batches[i], pmd);
     }
 }
 
+/* 数据包从端口进入数据路径的公共入口函数。
+ * md_is_valid=false，需要用 port_no 初始化 metadata。
+ * 由 dp_netdev_process_rxq_port() 在收包后调用。 */
 int32_t
 dp_netdev_input(struct dp_netdev_pmd_thread *pmd,
                 struct dp_packet_batch *packets,
@@ -8226,6 +9563,8 @@ dp_netdev_input(struct dp_netdev_pmd_thread *pmd,
     return 0;
 }
 
+/* 将数据包重入（recirculation）到数据路径进行二次处理。
+ * 常见场景：conntrack 处理后需要重新匹配流表、bond 选择后。 */
 static void
 dp_netdev_recirculate(struct dp_netdev_pmd_thread *pmd,
                       struct dp_packet_batch *packets)
@@ -8233,11 +9572,13 @@ dp_netdev_recirculate(struct dp_netdev_pmd_thread *pmd,
     dp_netdev_input__(pmd, packets, true, 0);
 }
 
+/* dp_execute_cb 的辅助结构，携带 PMD 线程和流信息。 */
 struct dp_netdev_execute_aux {
     struct dp_netdev_pmd_thread *pmd;
     const struct flow *flow;
 };
 
+/* 注册 dp 流表清除回调（PMD 删除时通知上层清理流表）。 */
 static void
 dpif_netdev_register_dp_purge_cb(struct dpif *dpif, dp_purge_callback *cb,
                                  void *aux)
@@ -8247,6 +9588,7 @@ dpif_netdev_register_dp_purge_cb(struct dpif *dpif, dp_purge_callback *cb,
     dp->dp_purge_cb = cb;
 }
 
+/* 注册 upcall 回调函数（流表未命中时调用此函数通知 vswitchd）。 */
 static void
 dpif_netdev_register_upcall_cb(struct dpif *dpif, upcall_callback *cb,
                                void *aux)
@@ -8256,6 +9598,9 @@ dpif_netdev_register_upcall_cb(struct dpif *dpif, upcall_callback *cb,
     dp->upcall_cb = cb;
 }
 
+/* XPS（Transmit Packet Steering）— PMD 发送方向的队列重验证。
+ * 检查每个 TX 端口的队列分配是否过期（超过 XPS_TIMEOUT），
+ * 如果过期或 purge=true，释放该 PMD 在此端口上占用的 TXQ。 */
 static void
 dpif_netdev_xps_revalidate_pmd(const struct dp_netdev_pmd_thread *pmd,
                                bool purge)
@@ -8279,6 +9624,10 @@ dpif_netdev_xps_revalidate_pmd(const struct dp_netdev_pmd_thread *pmd,
     }
 }
 
+/* XPS TX 队列 ID 获取 — 为 PMD 选择负载最低的 TX 队列。
+ * 如果当前分配的 TXQ 未过期，直接返回；否则重新分配：
+ * 遍历所有 TXQ，选择 txq_used[] 计数最小的队列。
+ * 分配后还会触发一次 revalidate 清理过期的旧分配。 */
 static int
 dpif_netdev_xps_get_tx_qid(const struct dp_netdev_pmd_thread *pmd,
                            struct tx_port *tx)
@@ -8323,6 +9672,7 @@ dpif_netdev_xps_get_tx_qid(const struct dp_netdev_pmd_thread *pmd,
     return min_qid;
 }
 
+/* 在隧道端口缓存中查找 TX 端口（用于隧道封装发送）。 */
 static struct tx_port *
 pmd_tnl_port_cache_lookup(const struct dp_netdev_pmd_thread *pmd,
                           odp_port_t port_no)
@@ -8330,6 +9680,7 @@ pmd_tnl_port_cache_lookup(const struct dp_netdev_pmd_thread *pmd,
     return tx_port_lookup(&pmd->tnl_port_cache, port_no);
 }
 
+/* 在普通发送端口缓存中查找 TX 端口（用于非隧道发送）。 */
 static struct tx_port *
 pmd_send_port_cache_lookup(const struct dp_netdev_pmd_thread *pmd,
                            odp_port_t port_no)
@@ -8337,6 +9688,9 @@ pmd_send_port_cache_lookup(const struct dp_netdev_pmd_thread *pmd,
     return tx_port_lookup(&pmd->send_port_cache, port_no);
 }
 
+/* 执行隧道封装（TUNNEL_PUSH）action。
+ * 查找隧道端口，调用 netdev_push_header() 添加外层隧道头。
+ * 失败时删除整个批次的包并返回错误。 */
 static int
 push_tnl_action(const struct dp_netdev_pmd_thread *pmd,
                 const struct nlattr *attr,
@@ -8362,6 +9716,9 @@ error:
     return err;
 }
 
+/* 执行 USERSPACE action — 将数据包发送到用户空间处理。
+ * 用于 sFlow 采样、NetFlow、packet-in 等场景。
+ * 调用 dp_netdev_upcall() 通知 vswitchd，然后执行返回的 action。 */
 static void
 dp_execute_userspace_action(struct dp_netdev_pmd_thread *pmd,
                             struct dp_packet *packet, bool should_steal,
@@ -8387,6 +9744,10 @@ dp_execute_userspace_action(struct dp_netdev_pmd_thread *pmd,
     }
 }
 
+/* 执行 OUTPUT action — 将数据包发送到指定端口。
+ * 查找目标端口的 tx_port 缓存，将包添加到输出批次 output_pkts 中。
+ * 如果输出批次满（超过 NETDEV_MAX_BURST）则先刷新。
+ * should_steal=false 时需要克隆包（原包仍被调用者持有）。 */
 static bool
 dp_execute_output_action(struct dp_netdev_pmd_thread *pmd,
                          struct dp_packet_batch *packets_,
@@ -8435,6 +9796,9 @@ dp_execute_output_action(struct dp_netdev_pmd_thread *pmd,
     return true;
 }
 
+/* 执行 LB_OUTPUT（负载均衡输出）action — bond 场景。
+ * 通过数据包的 RSS hash 选择 bond 成员端口，
+ * 逐包发送到对应的成员端口，并更新成员的包/字节统计。 */
 static void
 dp_execute_lb_output_action(struct dp_netdev_pmd_thread *pmd,
                             struct dp_packet_batch *packets_,
@@ -8478,6 +9842,16 @@ dp_execute_lb_output_action(struct dp_netdev_pmd_thread *pmd,
     }
 }
 
+/* action 执行回调 — 由 odp_execute_actions() 对每个 action 调用。
+ * 处理各类 ODP action：
+ * - OVS_ACTION_ATTR_OUTPUT：发送到指定端口
+ * - OVS_ACTION_ATTR_TUNNEL_PUSH/POP：隧道封装/解封装
+ * - OVS_ACTION_ATTR_USERSPACE：发送到用户空间（sFlow/NetFlow 等）
+ * - OVS_ACTION_ATTR_RECIRC：recirculation（重入处理）
+ * - OVS_ACTION_ATTR_CT：连接跟踪
+ * - OVS_ACTION_ATTR_METER：meter 计量
+ * - OVS_ACTION_ATTR_LB_OUTPUT：bond 输出
+ * 这是数据路径 action 执行的核心分发器。 */
 static void
 dp_execute_cb(void *aux_, struct dp_packet_batch *packets_,
               const struct nlattr *a, bool should_steal)
@@ -8808,6 +10182,8 @@ dp_execute_cb(void *aux_, struct dp_packet_batch *packets_,
     dp_packet_delete_batch(packets_, should_steal);
 }
 
+/* 执行 action 的总入口 — 封装 odp_execute_actions 调用。
+ * 将 PMD 和 flow 信息打包到 aux 结构中，传给 dp_execute_cb 回调。 */
 static void
 dp_netdev_execute_actions(struct dp_netdev_pmd_thread *pmd,
                           struct dp_packet_batch *packets,
@@ -8820,6 +10196,16 @@ dp_netdev_execute_actions(struct dp_netdev_pmd_thread *pmd,
                         actions_len, dp_execute_cb);
 }
 
+/* =====================================================
+ * 连接跟踪（Conntrack）dpif 接口实现。
+ *
+ * 这些函数将 dpif 层的 conntrack 操作委托给 conntrack 模块。
+ * 包括：连接表 dump（遍历）、flush（清空）、
+ * 最大连接数设置、TCP 序列号检查、zone 限制、
+ * 超时策略管理、IP 分片（IPF）管理等。
+ * ===================================================== */
+
+/* conntrack dump 上下文，关联 conntrack 实例和 dp。 */
 struct dp_netdev_ct_dump {
     struct ct_dpif_dump_state up;
     struct conntrack_dump dump;
@@ -8827,6 +10213,7 @@ struct dp_netdev_ct_dump {
     struct dp_netdev *dp;
 };
 
+/* 开始 conntrack 连接表 dump：分配 dump 上下文并初始化迭代器。 */
 static int
 dpif_netdev_ct_dump_start(struct dpif *dpif, struct ct_dpif_dump_state **dump_,
                           const uint16_t *pzone, int *ptot_bkts)
@@ -8845,6 +10232,7 @@ dpif_netdev_ct_dump_start(struct dpif *dpif, struct ct_dpif_dump_state **dump_,
     return 0;
 }
 
+/* 获取下一条 conntrack 连接表条目。 */
 static int
 dpif_netdev_ct_dump_next(struct dpif *dpif OVS_UNUSED,
                          struct ct_dpif_dump_state *dump_,
@@ -8857,6 +10245,7 @@ dpif_netdev_ct_dump_next(struct dpif *dpif OVS_UNUSED,
     return conntrack_dump_next(&dump->dump, entry);
 }
 
+/* 结束 conntrack dump 并释放资源。 */
 static int
 dpif_netdev_ct_dump_done(struct dpif *dpif OVS_UNUSED,
                          struct ct_dpif_dump_state *dump_)
@@ -8873,6 +10262,7 @@ dpif_netdev_ct_dump_done(struct dpif *dpif OVS_UNUSED,
     return err;
 }
 
+/* 开始 conntrack 期望（expectation）表 dump。 */
 static int
 dpif_netdev_ct_exp_dump_start(struct dpif *dpif,
                               struct ct_dpif_dump_state **dump_,
@@ -8892,6 +10282,7 @@ dpif_netdev_ct_exp_dump_start(struct dpif *dpif,
     return 0;
 }
 
+/* 获取下一条 conntrack 期望表条目。 */
 static int
 dpif_netdev_ct_exp_dump_next(struct dpif *dpif OVS_UNUSED,
                              struct ct_dpif_dump_state *dump_,
@@ -8904,6 +10295,7 @@ dpif_netdev_ct_exp_dump_next(struct dpif *dpif OVS_UNUSED,
     return conntrack_exp_dump_next(&dump->dump, entry);
 }
 
+/* 结束 conntrack 期望表 dump 并释放资源。 */
 static int
 dpif_netdev_ct_exp_dump_done(struct dpif *dpif OVS_UNUSED,
                              struct ct_dpif_dump_state *dump_)
@@ -8920,6 +10312,7 @@ dpif_netdev_ct_exp_dump_done(struct dpif *dpif OVS_UNUSED,
     return err;
 }
 
+/* 清空 conntrack 表。可按 zone 过滤或按 tuple 精确删除。 */
 static int
 dpif_netdev_ct_flush(struct dpif *dpif, const uint16_t *zone,
                      const struct ct_dpif_tuple *tuple)
@@ -8932,6 +10325,7 @@ dpif_netdev_ct_flush(struct dpif *dpif, const uint16_t *zone,
     return conntrack_flush(dp->conntrack, zone);
 }
 
+/* 设置 conntrack 最大连接数限制。 */
 static int
 dpif_netdev_ct_set_maxconns(struct dpif *dpif, uint32_t maxconns)
 {
@@ -8940,6 +10334,7 @@ dpif_netdev_ct_set_maxconns(struct dpif *dpif, uint32_t maxconns)
     return conntrack_set_maxconns(dp->conntrack, maxconns);
 }
 
+/* 查询 conntrack 最大连接数限制。 */
 static int
 dpif_netdev_ct_get_maxconns(struct dpif *dpif, uint32_t *maxconns)
 {
@@ -8948,6 +10343,7 @@ dpif_netdev_ct_get_maxconns(struct dpif *dpif, uint32_t *maxconns)
     return conntrack_get_maxconns(dp->conntrack, maxconns);
 }
 
+/* 查询 conntrack 当前活跃连接数。 */
 static int
 dpif_netdev_ct_get_nconns(struct dpif *dpif, uint32_t *nconns)
 {
@@ -8956,6 +10352,7 @@ dpif_netdev_ct_get_nconns(struct dpif *dpif, uint32_t *nconns)
     return conntrack_get_nconns(dp->conntrack, nconns);
 }
 
+/* 设置是否启用 TCP 序列号检查（安全性功能）。 */
 static int
 dpif_netdev_ct_set_tcp_seq_chk(struct dpif *dpif, bool enabled)
 {
@@ -8964,6 +10361,7 @@ dpif_netdev_ct_set_tcp_seq_chk(struct dpif *dpif, bool enabled)
     return conntrack_set_tcp_seq_chk(dp->conntrack, enabled);
 }
 
+/* 查询 TCP 序列号检查是否启用。 */
 static int
 dpif_netdev_ct_get_tcp_seq_chk(struct dpif *dpif, bool *enabled)
 {
@@ -8972,6 +10370,7 @@ dpif_netdev_ct_get_tcp_seq_chk(struct dpif *dpif, bool *enabled)
     return 0;
 }
 
+/* 设置 conntrack 清扫间隔（毫秒），用于回收过期连接。 */
 static int
 dpif_netdev_ct_set_sweep_interval(struct dpif *dpif, uint32_t ms)
 {
@@ -8979,6 +10378,7 @@ dpif_netdev_ct_set_sweep_interval(struct dpif *dpif, uint32_t ms)
     return conntrack_set_sweep_interval(dp->conntrack, ms);
 }
 
+/* 查询 conntrack 清扫间隔。 */
 static int
 dpif_netdev_ct_get_sweep_interval(struct dpif *dpif, uint32_t *ms)
 {
@@ -8987,6 +10387,8 @@ dpif_netdev_ct_get_sweep_interval(struct dpif *dpif, uint32_t *ms)
     return 0;
 }
 
+/* 设置 conntrack zone 连接数限制。
+ * 遍历 zone_limits 列表，逐个更新每个 zone 的上限。 */
 static int
 dpif_netdev_ct_set_limits(struct dpif *dpif,
                            const struct ovs_list *zone_limits)
@@ -9005,6 +10407,8 @@ dpif_netdev_ct_set_limits(struct dpif *dpif,
     return err;
 }
 
+/* 查询 conntrack zone 连接数限制。
+ * 如果请求列表非空，查询指定 zone；否则返回所有已设限的 zone。 */
 static int
 dpif_netdev_ct_get_limits(struct dpif *dpif,
                            const struct ovs_list *zone_limits_request,
@@ -9044,6 +10448,7 @@ dpif_netdev_ct_get_limits(struct dpif *dpif,
     return 0;
 }
 
+/* 删除指定 zone 的连接数限制。 */
 static int
 dpif_netdev_ct_del_limits(struct dpif *dpif,
                            const struct ovs_list *zone_limits)
@@ -9061,6 +10466,7 @@ dpif_netdev_ct_del_limits(struct dpif *dpif,
     return err;
 }
 
+/* 查询 conntrack 支持的特性标志（如 zero SNAT 支持）。 */
 static int
 dpif_netdev_ct_get_features(struct dpif *dpif OVS_UNUSED,
                             enum ct_features *features)
@@ -9071,6 +10477,7 @@ dpif_netdev_ct_get_features(struct dpif *dpif OVS_UNUSED,
     return 0;
 }
 
+/* 设置 conntrack 超时策略。 */
 static int
 dpif_netdev_ct_set_timeout_policy(struct dpif *dpif,
                                   const struct ct_dpif_timeout_policy *dpif_tp)
@@ -9083,6 +10490,7 @@ dpif_netdev_ct_set_timeout_policy(struct dpif *dpif,
     return timeout_policy_update(dp->conntrack, &tp);
 }
 
+/* 查询指定 ID 的 conntrack 超时策略。 */
 static int
 dpif_netdev_ct_get_timeout_policy(struct dpif *dpif, uint32_t tp_id,
                                   struct ct_dpif_timeout_policy *dpif_tp)
@@ -9100,6 +10508,7 @@ dpif_netdev_ct_get_timeout_policy(struct dpif *dpif, uint32_t tp_id,
     return err;
 }
 
+/* 删除指定 ID 的 conntrack 超时策略。 */
 static int
 dpif_netdev_ct_del_timeout_policy(struct dpif *dpif,
                                   uint32_t tp_id)
@@ -9112,6 +10521,7 @@ dpif_netdev_ct_del_timeout_policy(struct dpif *dpif,
     return err;
 }
 
+/* 获取超时策略的名称（直接用 ID 的字符串表示）。 */
 static int
 dpif_netdev_ct_get_timeout_policy_name(struct dpif *dpif OVS_UNUSED,
                                        uint32_t tp_id,
@@ -9127,6 +10537,7 @@ dpif_netdev_ct_get_timeout_policy_name(struct dpif *dpif OVS_UNUSED,
     return 0;
 }
 
+/* 启用/禁用 IP 分片重组（IPF）。v6=true 表示 IPv6，否则 IPv4。 */
 static int
 dpif_netdev_ipf_set_enabled(struct dpif *dpif, bool v6, bool enable)
 {
@@ -9134,6 +10545,7 @@ dpif_netdev_ipf_set_enabled(struct dpif *dpif, bool v6, bool enable)
     return ipf_set_enabled(conntrack_ipf_ctx(dp->conntrack), v6, enable);
 }
 
+/* 设置 IP 分片的最小分片大小阈值。 */
 static int
 dpif_netdev_ipf_set_min_frag(struct dpif *dpif, bool v6, uint32_t min_frag)
 {
@@ -9141,6 +10553,7 @@ dpif_netdev_ipf_set_min_frag(struct dpif *dpif, bool v6, uint32_t min_frag)
     return ipf_set_min_frag(conntrack_ipf_ctx(dp->conntrack), v6, min_frag);
 }
 
+/* 设置 IPF 允许缓存的最大分片数量。 */
 static int
 dpif_netdev_ipf_set_max_nfrags(struct dpif *dpif, uint32_t max_frags)
 {
@@ -9148,6 +10561,7 @@ dpif_netdev_ipf_set_max_nfrags(struct dpif *dpif, uint32_t max_frags)
     return ipf_set_max_nfrags(conntrack_ipf_ctx(dp->conntrack), max_frags);
 }
 
+/* 查询 IPF 的当前状态信息。 */
 /* Adjust this function if 'dpif_ipf_status' and 'ipf_status' were to
  * diverge. */
 static int
@@ -9160,6 +10574,7 @@ dpif_netdev_ipf_get_status(struct dpif *dpif,
     return 0;
 }
 
+/* 开始 IPF 分片信息 dump。 */
 static int
 dpif_netdev_ipf_dump_start(struct dpif *dpif OVS_UNUSED,
                            struct ipf_dump_ctx **ipf_dump_ctx)
@@ -9167,6 +10582,7 @@ dpif_netdev_ipf_dump_start(struct dpif *dpif OVS_UNUSED,
     return ipf_dump_start(ipf_dump_ctx);
 }
 
+/* 获取下一条 IPF 分片 dump 条目。 */
 static int
 dpif_netdev_ipf_dump_next(struct dpif *dpif, void *ipf_dump_ctx, char **dump)
 {
@@ -9175,6 +10591,7 @@ dpif_netdev_ipf_dump_next(struct dpif *dpif, void *ipf_dump_ctx, char **dump)
                          dump);
 }
 
+/* 结束 IPF 分片 dump。 */
 static int
 dpif_netdev_ipf_dump_done(struct dpif *dpif OVS_UNUSED, void *ipf_dump_ctx)
 {
@@ -9182,6 +10599,7 @@ dpif_netdev_ipf_dump_done(struct dpif *dpif OVS_UNUSED, void *ipf_dump_ctx)
 
 }
 
+/* 添加/更新 bond：设置哈希桶到成员端口的映射，并更新所有 PMD。 */
 static int
 dpif_netdev_bond_add(struct dpif *dpif, uint32_t bond_id,
                      odp_port_t *member_map)
@@ -9215,6 +10633,7 @@ dpif_netdev_bond_add(struct dpif *dpif, uint32_t bond_id,
     return 0;
 }
 
+/* 删除 bond 并从所有 PMD 中移除。 */
 static int
 dpif_netdev_bond_del(struct dpif *dpif, uint32_t bond_id)
 {
@@ -9242,6 +10661,7 @@ dpif_netdev_bond_del(struct dpif *dpif, uint32_t bond_id)
     return 0;
 }
 
+/* 获取 bond 各桶的字节统计（汇总所有 PMD）。 */
 static int
 dpif_netdev_bond_stats_get(struct dpif *dpif, uint32_t bond_id,
                            uint64_t *n_bytes)
@@ -9274,6 +10694,9 @@ dpif_netdev_bond_stats_get(struct dpif *dpif, uint32_t bond_id,
     return 0;
 }
 
+/* dpif_netdev_class — netdev datapath 的虚函数表。
+ * 将所有 dpif 接口函数注册到 "netdev" 类型的 datapath 类中。
+ * 这是 OVS 用户空间数据路径的核心入口点集合。 */
 const struct dpif_class dpif_netdev_class = {
     "netdev",
     true,                       /* cleanup_required */
@@ -9364,6 +10787,15 @@ const struct dpif_class dpif_netdev_class = {
     NULL,                       /* cache_set_size */
 };
 
+/* =====================================================
+ * Dummy dpif — 测试用的虚拟数据路径。
+ *
+ * 用于 OVS 单元测试（testsuite）。注册一个名为 "dummy" 的 dpif 类型，
+ * 其实现与 netdev datapath 相同，但允许在测试中模拟端口变更等操作。
+ * dpif_dummy_override() 可以替换真实的 "system" 类型用于测试。
+ * ===================================================== */
+
+/* 测试命令：更改 dummy datapath 中端口的端口号。 */
 static void
 dpif_dummy_change_port_number(struct unixctl_conn *conn, int argc OVS_UNUSED,
                               const char *argv[], void *aux OVS_UNUSED)
@@ -9415,6 +10847,7 @@ exit:
     dp_netdev_unref(dp);
 }
 
+/* 注册一个新的 dummy dpif 类型（复制 dpif_netdev_class 并改名）。 */
 static void
 dpif_dummy_register__(const char *type)
 {
@@ -9426,6 +10859,8 @@ dpif_dummy_register__(const char *type)
     dp_register_provider(class);
 }
 
+/* 用 dummy 实现替换已注册的 dpif 类型（如 "system"）。
+ * 先注销原类型，再注册同名的 dummy 版本。 */
 static void
 dpif_dummy_override(const char *type)
 {
@@ -9441,6 +10876,10 @@ dpif_dummy_override(const char *type)
     }
 }
 
+/* 注册 dummy dpif 类型和相关测试命令。
+ * DUMMY_OVERRIDE_ALL：替换所有已注册的 dpif 类型
+ * DUMMY_OVERRIDE_SYSTEM：只替换 "system" 类型
+ * 总是额外注册一个名为 "dummy" 的类型。 */
 void
 dpif_dummy_register(enum dummy_level level)
 {
@@ -9465,8 +10904,21 @@ dpif_dummy_register(enum dummy_level level)
                              3, 3, dpif_dummy_change_port_number, NULL);
 }
 
-/* Datapath Classifier. */
+/* =====================================================
+ * Datapath Classifier (dpcls) — 数据路径通配符分类器实现。
+ *
+ * dpcls 是 OVS-DPDK 流表查找的第三级（最后一级）：
+ *   EMC（精确匹配缓存）→ SMC（签名匹配缓存）→ dpcls（通配符分类器）
+ *
+ * 结构：每个入端口一个 dpcls，内含多个子表（subtable）。
+ * 每个子表对应一种 mask 模式（即哪些字段参与匹配）。
+ * 查找时按 pvector 优先级依次遍历子表，命中率高的子表排在前面。
+ *
+ * 子表查找使用 SIMD 优化的批量查找函数（如 AVX512），
+ * 通过 miniflow 的 mask 操作快速匹配。
+ * ===================================================== */
 
+/* RCU 延迟释放子表的回调。 */
 static void
 dpcls_subtable_destroy_cb(struct dpcls_subtable *subtable)
 {
@@ -9477,6 +10929,7 @@ dpcls_subtable_destroy_cb(struct dpcls_subtable *subtable)
 
 /* Initializes 'cls' as a classifier that initially contains no classification
  * rules. */
+/* 初始化分类器：创建子表映射和优先级向量。 */
 static void
 dpcls_init(struct dpcls *cls)
 {
@@ -9484,6 +10937,7 @@ dpcls_init(struct dpcls *cls)
     pvector_init(&cls->subtables);
 }
 
+/* 销毁指定子表：从优先级向量和 cmap 中移除，通过 RCU 延迟释放。 */
 static void
 dpcls_destroy_subtable(struct dpcls *cls, struct dpcls_subtable *subtable)
 {
@@ -9498,6 +10952,8 @@ dpcls_destroy_subtable(struct dpcls *cls, struct dpcls_subtable *subtable)
 /* Destroys 'cls'.  Rules within 'cls', if any, are not freed; this is the
  * caller's responsibility.
  * May only be called after all the readers have been terminated. */
+/* 销毁整个分类器：遍历并销毁所有子表，释放 cmap 和 pvector。
+ * 注意：子表中的 rule 不在此释放，由调用者负责。 */
 static void
 dpcls_destroy(struct dpcls *cls)
 {
@@ -9513,6 +10969,11 @@ dpcls_destroy(struct dpcls *cls)
     }
 }
 
+/* 创建新子表：
+ * 1) 分配内存，初始化 rule 的 cmap
+ * 2) 根据 mask 的位图计算 unit0/unit1 的位数，预生成 mask 数组
+ * 3) 选择最优的子表查找函数（可能是 SIMD 优化版本）
+ * 4) 插入 cmap 和 pvector（初始优先级为0，之后按命中率排序） */
 static struct dpcls_subtable *
 dpcls_create_subtable(struct dpcls *cls, const struct netdev_flow_key *mask)
 {
@@ -9556,6 +11017,7 @@ dpcls_create_subtable(struct dpcls *cls, const struct netdev_flow_key *mask)
     return subtable;
 }
 
+/* 按 mask 查找子表，不存在时自动创建新子表。 */
 static inline struct dpcls_subtable *
 dpcls_find_subtable(struct dpcls *cls, const struct netdev_flow_key *mask)
 {
@@ -9578,6 +11040,10 @@ dpcls_find_subtable(struct dpcls *cls, const struct netdev_flow_key *mask)
  * happen if dpcls_sort_subtable_vector() is called at the same time as this
  * function.
  */
+/* 重新探测所有子表的最优查找实现：
+ * 当用户通过 appctl 切换查找算法（如从 generic 切换到 avx512）时调用。
+ * 遍历每个子表，根据其 (unit0, unit1) 位数重新选择最佳查找函数。
+ * 返回实际发生了实现变更的子表数量。 */
 static uint32_t
 dpcls_subtable_lookup_reprobe(struct dpcls *cls)
 {
@@ -9612,6 +11078,8 @@ dpcls_subtable_lookup_reprobe(struct dpcls *cls)
 }
 
 /* Periodically sort the dpcls subtable vectors according to hit counts */
+/* 按命中次数对子表排序：命中多的子表优先级更高，下次查找时会先被检查。
+ * 排序后重置 hit_cnt 计数器，开始新一轮统计。 */
 static void
 dpcls_sort_subtable_vector(struct dpcls *cls)
 {
@@ -9625,6 +11093,20 @@ dpcls_sort_subtable_vector(struct dpcls *cls)
     pvector_publish(pvec);
 }
 
+/* PMD 周期性优化函数，在 PMD 主循环中每 1024 次迭代调用一次。
+ *
+ * 两个独立的定时任务：
+ * ┌──────────────────────────────────────────────────────────┐
+ * │ 任务 1：周期统计（PMD_INTERVAL_LEN 间隔）                 │
+ * │  - 计算 idle/busy/sleep 周期差值 → PMD 负载率             │
+ * │  - 负载率超阈值 → 标记过载 → 触发自动负载均衡（auto-lb）   │
+ * │  - 采集每个 RXQ 的处理周期 → 用于 RXQ 重分配决策           │
+ * │  - 记录忙碌周期到环形缓冲 → 用于控制线程读取负载           │
+ * ├──────────────────────────────────────────────────────────┤
+ * │ 任务 2：子表排序（DPCLS_OPTIMIZATION_INTERVAL 间隔）      │
+ * │  - 对所有 dpcls 分类器的子表按命中率排序                   │
+ * │  - 命中率高的子表排到前面 → 减少平均查找次数               │
+ * └──────────────────────────────────────────────────────────┘ */
 static inline void
 dp_netdev_pmd_try_optimize(struct dp_netdev_pmd_thread *pmd,
                            struct polled_queue *poll_list, int poll_cnt)
@@ -9633,16 +11115,20 @@ dp_netdev_pmd_try_optimize(struct dp_netdev_pmd_thread *pmd,
     uint64_t tot_idle = 0, tot_proc = 0, tot_sleep = 0;
     unsigned int pmd_load = 0;
 
+    /* === 任务 1：周期统计（每 PMD_INTERVAL_LEN 纳秒执行一次）=== */
     if (pmd->ctx.now > pmd->next_cycle_store) {
         uint64_t curr_tsc;
         uint8_t rebalance_load_trigger;
         struct pmd_auto_lb *pmd_alb = &pmd->dp->pmd_alb;
         unsigned int idx;
 
+        /* 计算本周期内的 idle/busy/sleep 增量。
+         * 需要检查计数器未被外部清零（>= prev 判断），否则跳过。 */
         if (pmd->perf_stats.counters.n[PMD_CYCLES_ITER_IDLE] >=
                 pmd->prev_stats[PMD_CYCLES_ITER_IDLE] &&
             pmd->perf_stats.counters.n[PMD_CYCLES_ITER_BUSY] >=
                 pmd->prev_stats[PMD_CYCLES_ITER_BUSY]) {
+            /* 增量 = 当前累计 - 上次记录值 */
             tot_idle = pmd->perf_stats.counters.n[PMD_CYCLES_ITER_IDLE] -
                        pmd->prev_stats[PMD_CYCLES_ITER_IDLE];
             tot_proc = pmd->perf_stats.counters.n[PMD_CYCLES_ITER_BUSY] -
@@ -9650,22 +11136,28 @@ dp_netdev_pmd_try_optimize(struct dp_netdev_pmd_thread *pmd,
             tot_sleep = pmd->perf_stats.counters.n[PMD_CYCLES_SLEEP] -
                         pmd->prev_stats[PMD_CYCLES_SLEEP];
 
+            /* 自动负载均衡（auto-lb）：仅对非隔离的 PMD 生效 */
             if (pmd_alb->is_enabled && !pmd->isolated) {
                 if (tot_proc) {
+                    /* 负载率 = busy / (idle + busy + sleep) × 100% */
                     pmd_load = ((tot_proc * 100) /
                                     (tot_idle + tot_proc + tot_sleep));
                 }
 
+                /* 读取过载阈值（由 other_config:pmd-auto-lb-load-threshold 配置） */
                 atomic_read_relaxed(&pmd_alb->rebalance_load_thresh,
                                     &rebalance_load_trigger);
                 if (pmd_load >= rebalance_load_trigger) {
+                    /* 超过阈值：递增过载计数（连续超标才会触发重均衡） */
                     atomic_count_inc(&pmd->pmd_overloaded);
                 } else {
+                    /* 负载恢复正常：重置过载计数 */
                     atomic_count_set(&pmd->pmd_overloaded, 0);
                 }
             }
         }
 
+        /* 保存当前计数器值作为下次计算增量的基准 */
         pmd->prev_stats[PMD_CYCLES_ITER_IDLE] =
                         pmd->perf_stats.counters.n[PMD_CYCLES_ITER_IDLE];
         pmd->prev_stats[PMD_CYCLES_ITER_BUSY] =
@@ -9673,7 +11165,9 @@ dp_netdev_pmd_try_optimize(struct dp_netdev_pmd_thread *pmd,
         pmd->prev_stats[PMD_CYCLES_SLEEP] =
                         pmd->perf_stats.counters.n[PMD_CYCLES_SLEEP];
 
-        /* Get the cycles that were used to process each queue and store. */
+        /* 采集每个 RXQ 在本周期内的处理周期数，
+         * 存入 RXQ 的间隔环形缓冲（用于 roundrobin/cycles 调度策略），
+         * 然后重置当前计数器为 0 开始下一周期。 */
         for (unsigned i = 0; i < poll_cnt; i++) {
             uint64_t rxq_cyc_curr = dp_netdev_rxq_get_cycles(poll_list[i].rxq,
                                                         RXQ_CYCLES_PROC_CURR);
@@ -9681,29 +11175,35 @@ dp_netdev_pmd_try_optimize(struct dp_netdev_pmd_thread *pmd,
             dp_netdev_rxq_set_cycles(poll_list[i].rxq, RXQ_CYCLES_PROC_CURR,
                                      0);
         }
+
+        /* 记录当前 TSC，计算本周期的总 TSC 差值（idle+busy+sleep 的总时间） */
         curr_tsc = cycles_counter_update(&pmd->perf_stats);
         if (pmd->intrvl_tsc_prev) {
-            /* There is a prev timestamp, store a new intrvl cycle count. */
+            /* 存储总间隔周期，供控制线程计算此 PMD 的总体利用率 */
             atomic_store_relaxed(&pmd->intrvl_cycles,
                                  curr_tsc - pmd->intrvl_tsc_prev);
         }
+        /* 将本周期的 busy 周期数存入环形缓冲（PMD_INTERVAL_MAX 个槽位） */
         idx = atomic_count_inc(&pmd->intrvl_idx) % PMD_INTERVAL_MAX;
         atomic_store_relaxed(&pmd->busy_cycles_intrvl[idx], tot_proc);
         pmd->intrvl_tsc_prev = curr_tsc;
-        /* Start new measuring interval */
+        /* 设置下一次周期统计的触发时间 */
         pmd->next_cycle_store = pmd->ctx.now + PMD_INTERVAL_LEN;
     }
 
+    /* === 任务 2：dpcls 子表排序（每 DPCLS_OPTIMIZATION_INTERVAL 纳秒一次）=== */
     if (pmd->ctx.now > pmd->next_optimization) {
-        /* Try to obtain the flow lock to block out revalidator threads.
-         * If not possible, just try next time. */
+        /* 尝试获取 flow_mutex，避免与 revalidator 线程冲突。
+         * 使用 trylock 而非阻塞锁 — 获取不到就下次再来，
+         * 不能在 PMD 热路径上阻塞。 */
         if (!ovs_mutex_trylock(&pmd->flow_mutex)) {
-            /* Optimize each classifier */
+            /* 遍历所有分类器（每个入端口一个），
+             * 按子表的累计命中次数重新排列 pvector 优先级 */
             CMAP_FOR_EACH (cls, node, &pmd->classifiers) {
                 dpcls_sort_subtable_vector(cls);
             }
             ovs_mutex_unlock(&pmd->flow_mutex);
-            /* Start new measuring interval */
+            /* 设置下一次子表排序的触发时间 */
             pmd->next_optimization = pmd->ctx.now
                                      + DPCLS_OPTIMIZATION_INTERVAL;
         }
@@ -9714,6 +11214,8 @@ dp_netdev_pmd_try_optimize(struct dp_netdev_pmd_thread *pmd,
  * oldest interval values. 'cur_idx' is where the next
  * write will be and wrap around needs to be handled.
  */
+/* 从环形缓冲区中读取最近 num_to_read 个区间值并求和。
+ * 用于计算 RXQ 的平均处理周期数，支持负载均衡决策。 */
 static uint64_t
 get_interval_values(atomic_ullong *source, atomic_count *cur_idx,
                     int num_to_read) {
@@ -9732,6 +11234,7 @@ get_interval_values(atomic_ullong *source, atomic_count *cur_idx,
 }
 
 /* Insert 'rule' into 'cls'. */
+/* 向分类器插入规则：找到（或创建）对应 mask 的子表，将规则插入子表的 cmap。 */
 static void
 dpcls_insert(struct dpcls *cls, struct dpcls_rule *rule,
              const struct netdev_flow_key *mask)
@@ -9744,6 +11247,7 @@ dpcls_insert(struct dpcls *cls, struct dpcls_rule *rule,
 }
 
 /* Removes 'rule' from 'cls', also destructing the 'rule'. */
+/* 从分类器删除规则：从子表 cmap 中移除，若子表变空则销毁该子表。 */
 static void
 dpcls_remove(struct dpcls *cls, struct dpcls_rule *rule)
 {
@@ -9762,6 +11266,9 @@ dpcls_remove(struct dpcls *cls, struct dpcls_rule *rule)
 }
 
 /* Inner loop for mask generation of a unit, see dpcls_flow_key_gen_masks. */
+/* 为单个 unit（miniflow 的前半或后半）生成 mask 数组。
+ * 利用位操作逐个提取 iter 中的最低位，生成前缀掩码（lowest_bit - 1）。
+ * 这样在查找时可以直接用预计算的 mask 做与操作，避免运行时计算。 */
 static inline void
 dpcls_flow_key_gen_mask_unit(uint64_t iter, const uint64_t count,
                              uint64_t *mf_masks)
@@ -9784,6 +11291,8 @@ dpcls_flow_key_gen_mask_unit(uint64_t iter, const uint64_t count,
  * @param mf_bits_total Number of bits set in the whole miniflow (both units)
  * @param mf_bits_unit0 Number of bits set in unit0 of the miniflow
  */
+/* 为子表的 mask 生成预计算掩码数组，分别处理 unit0 和 unit1。
+ * 生成的 mf_masks 数组在子表查找时直接使用，避免运行时位操作开销。 */
 void
 dpcls_flow_key_gen_masks(const struct netdev_flow_key *tbl,
                          uint64_t *mf_masks,
@@ -9799,6 +11308,8 @@ dpcls_flow_key_gen_masks(const struct netdev_flow_key *tbl,
 
 /* Returns true if 'target' satisfies 'key' in 'mask', that is, if each 1-bit
  * in 'mask' the values in 'key' and 'target' are the same. */
+/* 逐字段检查报文 key 是否匹配规则：(target & mask) == key。
+ * 这是 generic 查找路径的核心匹配函数。 */
 inline bool
 dpcls_rule_matches_key(const struct dpcls_rule *rule,
                        const struct netdev_flow_key *target)
@@ -9825,6 +11336,16 @@ dpcls_rule_matches_key(const struct dpcls_rule *rule,
  * priorities, instead returning any rule which matches the flow.
  *
  * Returns true if all miniflows found a corresponding rule. */
+/* dpcls 批量查找核心函数：
+ * 对一批报文（最多 NETDEV_MAX_BURST 个）同时进行子表查找。
+ *
+ * 算法流程：
+ * 1) 用位图 keys_map 跟踪尚未匹配的报文
+ * 2) 按优先级遍历子表（pvector），调用子表的批量查找函数
+ * 3) 每找到匹配就从 keys_map 中清除对应位
+ * 4) 所有报文都匹配后提前返回 true；遍历完仍有未匹配则返回 false
+ *
+ * 同时统计 lookups_match（加权查找深度），用于子表排序优化。 */
 bool
 dpcls_lookup(struct dpcls *cls, const struct netdev_flow_key *keys[],
              struct dpcls_rule **rules, const size_t cnt,

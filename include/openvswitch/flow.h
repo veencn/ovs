@@ -97,66 +97,79 @@ BUILD_ASSERT_DECL(FLOW_MAX_VLAN_HEADERS % 2 == 0);
  * NOTE: Order of the fields is significant, any change in the order must be
  * reflected in miniflow_extract()!
  */
+/* OVS 流匹配结构体 — 描述一个数据包的所有可匹配字段。
+ *
+ * 这是 OVS 中最核心的数据结构之一，贯穿整个数据包处理流水线：
+ *   miniflow_extract() 从数据包中提取字段填充此结构
+ *   → OpenFlow 流表匹配基于此结构的字段
+ *   → datapath 流表（EMC/SMC/dpcls）的 key 是此结构的压缩形式（miniflow）
+ *
+ * 字段按协议层次组织：Metadata → L2 → L3 → L4
+ * 每个字段都是 64 位对齐的（用 pad 填充），这对 miniflow 的位图压缩至关重要。
+ *
+ * 注意：字段顺序不能随意改变！miniflow_extract() 依赖此顺序。
+ * 修改此结构时必须同步更新 FLOW_WC_SEQ 序列号。 */
 struct flow {
-    /* Metadata */
-    struct flow_tnl tunnel;     /* Encapsulating tunnel parameters. */
-    ovs_be64 metadata;          /* OpenFlow Metadata. */
-    uint32_t regs[FLOW_N_REGS]; /* Registers. */
-    uint32_t skb_priority;      /* Packet priority for QoS. */
-    uint32_t pkt_mark;          /* Packet mark. */
-    uint32_t dp_hash;           /* Datapath computed hash value. The exact
-                                 * computation is opaque to the user space. */
-    union flow_in_port in_port; /* Input port.*/
-    uint32_t recirc_id;         /* Must be exact match. */
-    uint8_t ct_state;           /* Connection tracking state. */
-    uint8_t ct_nw_proto;        /* CT orig tuple IP protocol. */
-    uint16_t ct_zone;           /* Connection tracking zone. */
-    uint32_t ct_mark;           /* Connection mark.*/
-    ovs_be32 packet_type;       /* OpenFlow packet type. */
-    ovs_u128 ct_label;          /* Connection label. */
-    uint32_t conj_id;           /* Conjunction ID. */
-    ofp_port_t actset_output;   /* Output port in action set. */
+    /* === Metadata（元数据）===
+     * 非数据包本身的字段，而是 OVS 内部的匹配上下文。 */
+    struct flow_tnl tunnel;     /* 隧道参数（VXLAN/GRE/Geneve 的外层头信息） */
+    ovs_be64 metadata;          /* OpenFlow metadata（64 位，流表间传递状态） */
+    uint32_t regs[FLOW_N_REGS]; /* OpenFlow 寄存器（用于流表间传递临时数据） */
+    uint32_t skb_priority;      /* QoS 优先级（映射到 Linux tc 的 skb->priority） */
+    uint32_t pkt_mark;          /* 数据包标记（映射到 Linux 的 skb->mark） */
+    uint32_t dp_hash;           /* 数据路径计算的哈希值（用于 select group 负载均衡，
+                                 * 具体算法对用户空间不透明） */
+    union flow_in_port in_port; /* 入端口（OpenFlow 端口号或 datapath 端口号） */
+    uint32_t recirc_id;         /* Recirculation ID（标识第几轮处理，必须精确匹配） */
+    uint8_t ct_state;           /* conntrack 状态（NEW/EST/REL/RPL/INV/TRK 等标志位） */
+    uint8_t ct_nw_proto;        /* conntrack 原始元组的 IP 协议号 */
+    uint16_t ct_zone;           /* conntrack zone（隔离不同租户的连接跟踪表） */
+    uint32_t ct_mark;           /* conntrack mark（32 位用户自定义标记） */
+    ovs_be32 packet_type;       /* OpenFlow 包类型（区分 Ethernet/IP 等） */
+    ovs_u128 ct_label;          /* conntrack label（128 位用户自定义标签） */
+    uint32_t conj_id;           /* conjunction ID（实现 AND 逻辑的流表匹配） */
+    ofp_port_t actset_output;   /* action set 中的输出端口（OpenFlow 1.1+） */
 
-    /* L2, Order the same as in the Ethernet header! (64-bit aligned) */
-    struct eth_addr dl_dst;     /* Ethernet destination address. */
-    struct eth_addr dl_src;     /* Ethernet source address. */
-    ovs_be16 dl_type;           /* Ethernet frame type.
-                                   Note: This also holds the Ethertype for L3
-                                   packets of type PACKET_TYPE(1, Ethertype) */
-    uint8_t pad1[2];            /* Pad to 64 bits. */
-    union flow_vlan_hdr vlans[FLOW_MAX_VLAN_HEADERS]; /* VLANs */
-    ovs_be32 mpls_lse[ROUND_UP(FLOW_MAX_MPLS_LABELS, 2)]; /* MPLS label stack
-                                                             (with padding). */
-    /* L3 (64-bit aligned) */
-    ovs_be32 nw_src;            /* IPv4 source address or ARP SPA. */
-    ovs_be32 nw_dst;            /* IPv4 destination address or ARP TPA. */
-    ovs_be32 ct_nw_src;         /* CT orig tuple IPv4 source address. */
-    ovs_be32 ct_nw_dst;         /* CT orig tuple IPv4 destination address. */
-    struct in6_addr ipv6_src;   /* IPv6 source address. */
-    struct in6_addr ipv6_dst;   /* IPv6 destination address. */
-    struct in6_addr ct_ipv6_src; /* CT orig tuple IPv6 source address. */
-    struct in6_addr ct_ipv6_dst; /* CT orig tuple IPv6 destination address. */
-    ovs_be32 ipv6_label;        /* IPv6 flow label. */
-    uint8_t nw_frag;            /* FLOW_FRAG_* flags. */
-    uint8_t nw_tos;             /* IP ToS (including DSCP and ECN). */
-    uint8_t nw_ttl;             /* IP TTL/Hop Limit. */
-    uint8_t nw_proto;           /* IP protocol or low 8 bits of ARP opcode. */
-    /* L4 (64-bit aligned) */
-    struct in6_addr nd_target;  /* IPv6 neighbor discovery (ND) target. */
-    struct eth_addr arp_sha;    /* ARP/ND source hardware address. */
-    struct eth_addr arp_tha;    /* ARP/ND target hardware address. */
-    ovs_be16 tcp_flags;         /* TCP flags/ICMPv6 ND options type. */
-    ovs_be16 pad2;              /* Pad to 64 bits. */
-    struct ovs_key_nsh nsh;     /* Network Service Header keys */
+    /* === L2（数据链路层）===
+     * 字段顺序与以太网头一致！64 位对齐。 */
+    struct eth_addr dl_dst;     /* 目的 MAC 地址 */
+    struct eth_addr dl_src;     /* 源 MAC 地址 */
+    ovs_be16 dl_type;           /* 以太网类型（如 0x0800=IPv4, 0x0806=ARP, 0x86DD=IPv6）
+                                   对 PACKET_TYPE(1, Ethertype) 的 L3 包也使用此字段 */
+    uint8_t pad1[2];            /* 填充到 64 位对齐 */
+    union flow_vlan_hdr vlans[FLOW_MAX_VLAN_HEADERS]; /* VLAN 标签（支持 QinQ 双层 VLAN） */
+    ovs_be32 mpls_lse[ROUND_UP(FLOW_MAX_MPLS_LABELS, 2)]; /* MPLS 标签栈
+                                                             （含填充对齐） */
+    /* === L3（网络层）=== 64 位对齐 */
+    ovs_be32 nw_src;            /* IPv4 源地址（或 ARP 发送方 IP） */
+    ovs_be32 nw_dst;            /* IPv4 目的地址（或 ARP 目标 IP） */
+    ovs_be32 ct_nw_src;         /* conntrack 原始元组的 IPv4 源地址 */
+    ovs_be32 ct_nw_dst;         /* conntrack 原始元组的 IPv4 目的地址 */
+    struct in6_addr ipv6_src;   /* IPv6 源地址（128 位） */
+    struct in6_addr ipv6_dst;   /* IPv6 目的地址（128 位） */
+    struct in6_addr ct_ipv6_src; /* conntrack 原始元组的 IPv6 源地址 */
+    struct in6_addr ct_ipv6_dst; /* conntrack 原始元组的 IPv6 目的地址 */
+    ovs_be32 ipv6_label;        /* IPv6 流标签（20 位） */
+    uint8_t nw_frag;            /* IP 分片标志（FLOW_FRAG_ANY / FLOW_FRAG_LATER） */
+    uint8_t nw_tos;             /* IP ToS 字段（包含 DSCP 6 位 + ECN 2 位） */
+    uint8_t nw_ttl;             /* IP TTL / IPv6 Hop Limit */
+    uint8_t nw_proto;           /* IP 协议号（如 6=TCP, 17=UDP）或 ARP 操作码低 8 位 */
 
-    ovs_be16 tp_src;            /* TCP/UDP/SCTP source port/ICMP type. */
-    ovs_be16 tp_dst;            /* TCP/UDP/SCTP destination port/ICMP code. */
-    ovs_be16 ct_tp_src;         /* CT original tuple source port/ICMP type. */
-    ovs_be16 ct_tp_dst;         /* CT original tuple dst port/ICMP code. */
-    ovs_be32 igmp_group_ip4;    /* IGMP group IPv4 address/ICMPv6 ND reserved
-                                 * field.
-                                 * Keep last for BUILD_ASSERT_DECL below. */
-    ovs_be32 pad3;              /* Pad to 64 bits. */
+    /* === L4（传输层）=== 64 位对齐 */
+    struct in6_addr nd_target;  /* IPv6 邻居发现（ND）目标地址 */
+    struct eth_addr arp_sha;    /* ARP/ND 源硬件地址（发送方 MAC） */
+    struct eth_addr arp_tha;    /* ARP/ND 目标硬件地址（目标 MAC） */
+    ovs_be16 tcp_flags;         /* TCP 标志位（SYN/ACK/FIN 等）/ ICMPv6 ND 选项类型 */
+    ovs_be16 pad2;              /* 填充到 64 位对齐 */
+    struct ovs_key_nsh nsh;     /* NSH（Network Service Header）字段（SFC 服务链） */
+
+    ovs_be16 tp_src;            /* TCP/UDP/SCTP 源端口 或 ICMP 类型 */
+    ovs_be16 tp_dst;            /* TCP/UDP/SCTP 目的端口 或 ICMP 代码 */
+    ovs_be16 ct_tp_src;         /* conntrack 原始元组的源端口 / ICMP 类型 */
+    ovs_be16 ct_tp_dst;         /* conntrack 原始元组的目的端口 / ICMP 代码 */
+    ovs_be32 igmp_group_ip4;    /* IGMP 组播组 IPv4 地址 / ICMPv6 ND 保留字段
+                                 * 必须是最后一个有效字段（BUILD_ASSERT_DECL 检查） */
+    ovs_be32 pad3;              /* 填充到 64 位对齐 */
 };
 BUILD_ASSERT_DECL(sizeof(struct flow) % sizeof(uint64_t) == 0);
 BUILD_ASSERT_DECL(sizeof(struct flow_tnl) % sizeof(uint64_t) == 0);

@@ -47,6 +47,13 @@ static struct vlog_rate_limit latency_rl = VLOG_RATE_LIMIT_INIT(600, 600);
 
 static uint64_t tsc_hz = 1;
 
+/* @veencn_260223: Expose TSC frequency for latency measurement. */
+uint64_t
+pmd_perf_get_tsc_hz(void)
+{
+    return tsc_hz;
+}
+
 void
 pmd_perf_estimate_tsc_frequency(void)
 {

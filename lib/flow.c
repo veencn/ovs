@@ -792,38 +792,65 @@ dump_invalid_packet(struct dp_packet *packet, const char *reason)
  *      present and the packet has at least the content used for the fields
  *      of interest for the flow, otherwise UINT16_MAX.
  */
+/* OVS 数据包解析的核心函数 — 从原始数据包中提取所有可匹配字段，填充到 miniflow 中。
+ *
+ * 这是整个 OVS 快速路径的起点：每个数据包进入 PMD 后，首先经过此函数解析，
+ * 生成的 miniflow 随后用于 EMC/SMC/dpcls 多级流表查找。
+ *
+ * miniflow 是 struct flow 的压缩表示：
+ *   - 使用两个 64 位位图（map）标记哪些 uint64_t 槽位有非零值
+ *   - 只存储非零值，因此内存占用远小于完整的 struct flow（~632 字节）
+ *   - 典型的 TCP/IPv4 包只需约 13 个 uint64_t（~104 字节）
+ *
+ * 字段提取顺序严格遵循 struct flow 的成员顺序（Metadata → L2 → L3 → L4），
+ * 因为 miniflow_push_* 宏依赖顺序递增写入。
+ *
+ * 性能关键路径 — 此函数对每个数据包调用一次，使用了大量 OVS_LIKELY/OVS_UNLIKELY
+ * 分支预测优化，常见路径（IPv4 TCP）被优化为最短执行路径。 */
 void
 miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
 {
     /* Add code to this function (or its callees) to extract new fields. */
-    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 43);
+    BUILD_ASSERT_DECL(FLOW_WC_SEQ == 43);  /* 编译断言：若 FLOW_WC_SEQ 变化，
+                                             * 提醒开发者更新此函数 */
 
-    const struct pkt_metadata *md = &packet->md;
-    const void *data = dp_packet_data(packet);
-    size_t size = dp_packet_size(packet);
-    ovs_be32 packet_type = packet->packet_type;
-    uint64_t *values = miniflow_values(dst);
+    const struct pkt_metadata *md = &packet->md;  /* 包的元数据（入端口、隧道、conntrack 等） */
+    const void *data = dp_packet_data(packet);     /* 游标指针：指向当前解析位置，逐层前移 */
+    size_t size = dp_packet_size(packet);          /* 剩余数据长度，随解析递减 */
+    ovs_be32 packet_type = packet->packet_type;    /* 包类型（PT_ETH=以太网, 或 L3 类型） */
+    uint64_t *values = miniflow_values(dst);       /* miniflow 值数组的起始地址 */
     struct mf_ctx mf = { FLOWMAP_EMPTY_INITIALIZER, values,
-                         values + FLOW_U64S };
-    const char *frame;
-    ovs_be16 dl_type = OVS_BE16_MAX;
-    uint8_t nw_frag, nw_tos, nw_ttl, nw_proto;
-    uint8_t *ct_nw_proto_p = NULL;
-    ovs_be16 ct_tp_src = 0, ct_tp_dst = 0;
+                         values + FLOW_U64S };     /* miniflow 构建上下文：
+                                                    * map=位图, data=写入指针, end=边界 */
+    const char *frame;                             /* 帧起始地址，用于计算各层偏移 */
+    ovs_be16 dl_type = OVS_BE16_MAX;              /* 以太网类型，初始化为无效值 */
+    uint8_t nw_frag, nw_tos, nw_ttl, nw_proto;   /* L3 字段：分片/ToS/TTL/协议号 */
+    uint8_t *ct_nw_proto_p = NULL;                /* 指向 miniflow 中 ct_nw_proto 的指针，
+                                                    * 用于后续回填 conntrack 原始元组协议号 */
+    ovs_be16 ct_tp_src = 0, ct_tp_dst = 0;       /* conntrack 原始元组的 L4 端口，
+                                                    * 在 L3 解析时提取，L4 解析时写入 miniflow */
+
+    /* ================================================================
+     * 第1段：Metadata（元数据）提取
+     * 对应 struct flow 的第一个段（FLOW_SEGMENT_1）。
+     * ================================================================ */
 
     /* Metadata. */
-    if (flow_tnl_dst_is_set(&md->tunnel)) {
+    /* --- 隧道元数据 --- */
+    if (flow_tnl_dst_is_set(&md->tunnel)) {    /* 有隧道封装（VXLAN/GRE/Geneve 等） */
         miniflow_push_words(mf, tunnel, &md->tunnel,
                             offsetof(struct flow_tnl, metadata) /
-                            sizeof(uint64_t));
+                            sizeof(uint64_t));  /* 推入隧道基本字段（src/dst/id/flags 等） */
 
         if (!(md->tunnel.flags & FLOW_TNL_F_UDPIF)) {
+            /* 非 UDPIF 格式：Geneve 预解析的 TLV 元数据（按 map 位图组织） */
             if (md->tunnel.metadata.present.map) {
                 miniflow_push_words(mf, tunnel.metadata, &md->tunnel.metadata,
                                     sizeof md->tunnel.metadata /
                                     sizeof(uint64_t));
             }
         } else {
+            /* UDPIF 格式：原始 Geneve TLV 选项（未预解析，按长度存储） */
             if (md->tunnel.metadata.present.len) {
                 miniflow_push_words(mf, tunnel.metadata.present,
                                     &md->tunnel.metadata.present, 1);
@@ -834,156 +861,190 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
             }
         }
     }
-    if (md->skb_priority || md->pkt_mark) {
+    /* --- QoS 优先级 和 包标记 --- */
+    if (md->skb_priority || md->pkt_mark) {    /* 仅在非零时推入（节省 miniflow 空间） */
         miniflow_push_uint32(mf, skb_priority, md->skb_priority);
         miniflow_push_uint32(mf, pkt_mark, md->pkt_mark);
     }
+    /* --- dp_hash 和 入端口（必填字段，每个包都有）--- */
     miniflow_push_uint32(mf, dp_hash, md->dp_hash);
     miniflow_push_uint32(mf, in_port, odp_to_u32(md->in_port.odp_port));
+
+    /* --- Conntrack 状态 和 Recirculation ID --- */
     if (md->ct_state) {
+        /* 有 conntrack 状态：推入完整的 ct 相关字段 */
         miniflow_push_uint32(mf, recirc_id, md->recirc_id);
-        miniflow_push_uint8(mf, ct_state, md->ct_state);
-        ct_nw_proto_p = miniflow_pointer(mf, ct_nw_proto);
-        miniflow_push_uint8(mf, ct_nw_proto, 0);
-        miniflow_push_uint16(mf, ct_zone, md->ct_zone);
-        miniflow_push_uint32(mf, ct_mark, md->ct_mark);
+        miniflow_push_uint8(mf, ct_state, md->ct_state);   /* ct 状态标志（NEW/EST/REL...） */
+        ct_nw_proto_p = miniflow_pointer(mf, ct_nw_proto);  /* 记录指针，L3 解析时回填 */
+        miniflow_push_uint8(mf, ct_nw_proto, 0);           /* 先推 0，稍后回填 */
+        miniflow_push_uint16(mf, ct_zone, md->ct_zone);    /* conntrack zone */
+        miniflow_push_uint32(mf, ct_mark, md->ct_mark);    /* conntrack mark */
         miniflow_push_be32(mf, packet_type, packet_type);
         if (!ovs_u128_is_zero(md->ct_label)) {
             miniflow_push_words(mf, ct_label, &md->ct_label,
-                                sizeof md->ct_label / sizeof(uint64_t));
+                                sizeof md->ct_label / sizeof(uint64_t)); /* ct label（128位） */
         }
     } else {
+        /* 无 conntrack 状态：只推 recirc_id 和 packet_type */
         if (md->recirc_id) {
             miniflow_push_uint32(mf, recirc_id, md->recirc_id);
-            miniflow_pad_to_64(mf, recirc_id);
+            miniflow_pad_to_64(mf, recirc_id);             /* 填充到 64 位对齐 */
         }
-        miniflow_pad_from_64(mf, packet_type);
+        miniflow_pad_from_64(mf, packet_type);             /* 跳过中间的 ct 字段 */
         miniflow_push_be32(mf, packet_type, packet_type);
     }
 
+    /* ================================================================
+     * 第2段：L2（数据链路层 Data Link）提取
+     * 对应 struct flow 的第二个段（FLOW_SEGMENT_2）。
+     * ================================================================ */
+
     /* Initialize packet's layer pointer and offsets. */
-    frame = data;
+    frame = data;                                  /* 记录帧起始位置 */
     if (dp_packet_tunnel(packet)) {
         /* Preserve inner offsets from previous circulation. */
-        dp_packet_reset_outer_offsets(packet);
+        dp_packet_reset_outer_offsets(packet);      /* 隧道包：保留内层偏移，重置外层 */
     } else {
-        dp_packet_reset_offsets(packet);
+        dp_packet_reset_offsets(packet);            /* 普通包：重置所有偏移 */
     }
 
     if (packet_type == htonl(PT_ETH)) {
+        /* === 以太网包（最常见路径）=== */
         /* Must have full Ethernet header to proceed. */
         if (OVS_UNLIKELY(size < sizeof(struct eth_header))) {
-            goto out;
+            goto out;                              /* 包太短，无法解析以太网头 */
         } else {
             /* Link layer. */
-            ASSERT_SEQUENTIAL(dl_dst, dl_src);
-            miniflow_push_macs(mf, dl_dst, data);
+            ASSERT_SEQUENTIAL(dl_dst, dl_src);     /* 编译断言：dl_dst 和 dl_src 在内存中相邻 */
+            miniflow_push_macs(mf, dl_dst, data);  /* 一次推入目的 MAC + 源 MAC（12 字节）
+                                                    * 同时将 data 前移过以太网头 */
 
             /* VLAN */
-            union flow_vlan_hdr vlans[FLOW_MAX_VLAN_HEADERS];
-            size_t num_vlans = parse_vlan(&data, &size, vlans);
+            union flow_vlan_hdr vlans[FLOW_MAX_VLAN_HEADERS]; /* 最多支持 2 层 VLAN（QinQ） */
+            size_t num_vlans = parse_vlan(&data, &size, vlans); /* 解析 VLAN 标签，
+                                                                 * data 跳过 VLAN 头 */
 
-            dl_type = parse_ethertype(&data, &size);
+            dl_type = parse_ethertype(&data, &size); /* 解析 EtherType（0x0800/0x86DD/...），
+                                                      * data 跳过 EtherType 字段 */
             miniflow_push_be16(mf, dl_type, dl_type);
-            miniflow_pad_to_64(mf, dl_type);
+            miniflow_pad_to_64(mf, dl_type);       /* 填充到 64 位对齐（对应 pad1[2]） */
             if (num_vlans > 0) {
-                miniflow_push_words_32(mf, vlans, vlans, num_vlans);
+                miniflow_push_words_32(mf, vlans, vlans, num_vlans); /* 推入 VLAN 标签 */
             }
 
         }
     } else {
+        /* === 非以太网包（L3 包，如 PACKET_TYPE(1, ETH_TYPE_IP)）=== */
         /* Take dl_type from packet_type. */
-        dl_type = pt_ns_type_be(packet_type);
-        miniflow_pad_from_64(mf, dl_type);
+        dl_type = pt_ns_type_be(packet_type);      /* 从 packet_type 中提取 EtherType */
+        miniflow_pad_from_64(mf, dl_type);         /* 跳过 dl_dst/dl_src（L3 包无 MAC） */
         miniflow_push_be16(mf, dl_type, dl_type);
         /* Do not push vlan_tci, pad instead */
-        miniflow_pad_to_64(mf, dl_type);
+        miniflow_pad_to_64(mf, dl_type);           /* 跳过 VLAN 字段 */
     }
 
+    /* --- MPLS 标签栈（罕见路径）--- */
     /* Parse mpls. */
     if (OVS_UNLIKELY(eth_type_mpls(dl_type))) {
         int count;
         const void *mpls = data;
 
-        packet->l2_5_ofs = (char *)data - frame;
-        count = parse_mpls(&data, &size);
-        miniflow_push_words_32(mf, mpls_lse, mpls, count);
+        packet->l2_5_ofs = (char *)data - frame;  /* 记录 L2.5（MPLS shim）偏移 */
+        count = parse_mpls(&data, &size);          /* 解析 MPLS 标签栈，返回标签数量 */
+        miniflow_push_words_32(mf, mpls_lse, mpls, count); /* 推入 MPLS LSE 数组 */
     }
 
+    /* ================================================================
+     * 第3段：L3（网络层）提取
+     * 对应 struct flow 的第三个段（FLOW_SEGMENT_3）。
+     * ================================================================ */
+
     /* Network layer. */
-    packet->l3_ofs = (char *)data - frame;
+    packet->l3_ofs = (char *)data - frame;         /* 记录 L3 层偏移 */
 
     nw_frag = 0;
     if (OVS_LIKELY(dl_type == htons(ETH_TYPE_IP))) {
+        /* === IPv4 路径（最常见，OVS_LIKELY 优化分支预测）=== */
         const struct ip_header *nh = data;
-        int ip_len;
-        uint16_t tot_len;
+        int ip_len;                                /* IP 头长度（含选项） */
+        uint16_t tot_len;                          /* IP 总长度 */
 
+        /* 校验 IPv4 头：版本、IHL、长度、不越界等 */
         if (OVS_UNLIKELY(!ipv4_sanity_check(nh, size, &ip_len, &tot_len))) {
             if (OVS_UNLIKELY(VLOG_IS_DBG_ENABLED())) {
                 dump_invalid_packet(packet, "ipv4_sanity_check");
             }
-            goto out;
+            goto out;                              /* 非法 IPv4 包，终止解析 */
         }
-        dp_packet_set_l2_pad_size(packet, size - tot_len);
-        size = tot_len;   /* Never pull padding. */
+        dp_packet_set_l2_pad_size(packet, size - tot_len); /* 记录 L2 填充大小 */
+        size = tot_len;   /* Never pull padding. */  /* 排除以太网填充，只看 IP 载荷 */
 
         /* Push both source and destination address at once. */
-        miniflow_push_words(mf, nw_src, &nh->ip_src, 1);
+        miniflow_push_words(mf, nw_src, &nh->ip_src, 1); /* 推入 nw_src + nw_dst（8 字节）
+                                                           * ip_src 和 ip_dst 在 IP 头中相邻 */
+        /* --- conntrack 原始元组（IPv4）--- */
         if (ct_nw_proto_p && !md->ct_orig_tuple_ipv6) {
-            *ct_nw_proto_p = md->ct_orig_tuple.ipv4.ipv4_proto;
+            *ct_nw_proto_p = md->ct_orig_tuple.ipv4.ipv4_proto; /* 回填 ct_nw_proto */
             if (*ct_nw_proto_p) {
                 miniflow_push_words(mf, ct_nw_src,
-                                    &md->ct_orig_tuple.ipv4.ipv4_src, 1);
-                ct_tp_src = md->ct_orig_tuple.ipv4.src_port;
+                                    &md->ct_orig_tuple.ipv4.ipv4_src, 1); /* ct_nw_src+ct_nw_dst */
+                ct_tp_src = md->ct_orig_tuple.ipv4.src_port;  /* 暂存，L4 解析时推入 */
                 ct_tp_dst = md->ct_orig_tuple.ipv4.dst_port;
             }
         }
 
         miniflow_push_be32(mf, ipv6_label, 0); /* Padding for IPv4. */
+                                                /* IPv4 无流标签，推 0 作为 ipv6_label 的占位 */
 
-        nw_tos = nh->ip_tos;
-        nw_ttl = nh->ip_ttl;
-        nw_proto = nh->ip_proto;
-        nw_frag = ipv4_get_nw_frag(nh);
-        data_pull(&data, &size, ip_len);
+        nw_tos = nh->ip_tos;                   /* ToS 字段（DSCP 6位 + ECN 2位） */
+        nw_ttl = nh->ip_ttl;                   /* TTL */
+        nw_proto = nh->ip_proto;               /* 上层协议号（6=TCP, 17=UDP） */
+        nw_frag = ipv4_get_nw_frag(nh);        /* 分片标志（MF/offset → ANY/LATER） */
+        data_pull(&data, &size, ip_len);       /* data 前移到 L4 头 */
     } else if (dl_type == htons(ETH_TYPE_IPV6)) {
+        /* === IPv6 路径 === */
         const struct ovs_16aligned_ip6_hdr *nh = data;
-        ovs_be32 tc_flow;
-        uint16_t plen;
+        ovs_be32 tc_flow;                      /* Traffic Class + Flow Label 字段 */
+        uint16_t plen;                         /* 载荷长度 */
 
+        /* 校验 IPv6 头 */
         if (OVS_UNLIKELY(!ipv6_sanity_check(nh, size))) {
             if (OVS_UNLIKELY(VLOG_IS_DBG_ENABLED())) {
                 dump_invalid_packet(packet, "ipv6_sanity_check");
             }
             goto out;
         }
-        data_pull(&data, &size, sizeof *nh);
+        data_pull(&data, &size, sizeof *nh);   /* 跳过 IPv6 固定头（40 字节） */
         plen = ntohs(nh->ip6_plen);
         dp_packet_set_l2_pad_size(packet, size - plen);
         size = plen;   /* Never pull padding. */
 
+        /* 推入 IPv6 源地址（16 字节） */
         miniflow_push_words(mf, ipv6_src, &nh->ip6_src,
                             sizeof nh->ip6_src / 8);
+        /* 推入 IPv6 目的地址（16 字节） */
         miniflow_push_words(mf, ipv6_dst, &nh->ip6_dst,
                             sizeof nh->ip6_dst / 8);
+        /* --- conntrack 原始元组（IPv6）--- */
         if (ct_nw_proto_p && md->ct_orig_tuple_ipv6) {
-            *ct_nw_proto_p = md->ct_orig_tuple.ipv6.ipv6_proto;
+            *ct_nw_proto_p = md->ct_orig_tuple.ipv6.ipv6_proto; /* 回填 ct_nw_proto */
             if (*ct_nw_proto_p) {
                 miniflow_push_words(mf, ct_ipv6_src,
                                     &md->ct_orig_tuple.ipv6.ipv6_src,
                                     2 *
                                     sizeof md->ct_orig_tuple.ipv6.ipv6_src / 8);
+                                                   /* ct_ipv6_src + ct_ipv6_dst（32 字节） */
                 ct_tp_src = md->ct_orig_tuple.ipv6.src_port;
                 ct_tp_dst = md->ct_orig_tuple.ipv6.dst_port;
             }
         }
 
-        tc_flow = get_16aligned_be32(&nh->ip6_flow);
-        nw_tos = ntohl(tc_flow) >> 20;
-        nw_ttl = nh->ip6_hlim;
-        nw_proto = nh->ip6_nxt;
+        tc_flow = get_16aligned_be32(&nh->ip6_flow); /* 提取 TC+Flow Label 组合字段 */
+        nw_tos = ntohl(tc_flow) >> 20;             /* Traffic Class（高 8 位 = DSCP+ECN） */
+        nw_ttl = nh->ip6_hlim;                    /* Hop Limit（等价 IPv4 TTL） */
+        nw_proto = nh->ip6_nxt;                   /* Next Header（可能是扩展头） */
 
+        /* 遍历 IPv6 扩展头链，最终得到真正的上层协议号和分片标志 */
         if (!parse_ipv6_ext_hdrs(&data, &size, &nw_proto, &nw_frag,
                                  NULL, NULL)) {
             goto out;
@@ -992,84 +1053,100 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
         /* This needs to be after the parse_ipv6_ext_hdrs__() call because it
          * leaves the nw_frag word uninitialized. */
         ASSERT_SEQUENTIAL(ipv6_label, nw_frag);
-        ovs_be32 label = tc_flow & htonl(IPV6_LABEL_MASK);
+        ovs_be32 label = tc_flow & htonl(IPV6_LABEL_MASK); /* 提取 20 位流标签 */
         miniflow_push_be32(mf, ipv6_label, label);
     } else {
+        /* === 非 IP 协议：ARP / RARP / NSH === */
         if (dl_type == htons(ETH_TYPE_ARP) ||
             dl_type == htons(ETH_TYPE_RARP)) {
+            /* --- ARP/RARP 解析 --- */
             struct eth_addr arp_buf[2];
             const struct arp_eth_header *arp = (const struct arp_eth_header *)
                 data_try_pull(&data, &size, ARP_ETH_HEADER_LEN);
 
+            /* 验证 ARP 头：硬件类型=Ethernet, 协议类型=IP, 硬件长度=6, 协议长度=4 */
             if (OVS_LIKELY(arp) && OVS_LIKELY(arp->ar_hrd == htons(1))
                 && OVS_LIKELY(arp->ar_pro == htons(ETH_TYPE_IP))
                 && OVS_LIKELY(arp->ar_hln == ETH_ADDR_LEN)
                 && OVS_LIKELY(arp->ar_pln == 4)) {
                 miniflow_push_be32(mf, nw_src,
-                                   get_16aligned_be32(&arp->ar_spa));
+                                   get_16aligned_be32(&arp->ar_spa)); /* ARP 发送方 IP → nw_src */
                 miniflow_push_be32(mf, nw_dst,
-                                   get_16aligned_be32(&arp->ar_tpa));
+                                   get_16aligned_be32(&arp->ar_tpa)); /* ARP 目标 IP → nw_dst */
 
                 /* We only match on the lower 8 bits of the opcode. */
                 if (OVS_LIKELY(ntohs(arp->ar_op) <= 0xff)) {
                     miniflow_push_be32(mf, ipv6_label, 0); /* Pad with ARP. */
                     miniflow_push_be32(mf, nw_frag, htonl(ntohs(arp->ar_op)));
+                                                   /* ARP 操作码存入 nw_proto 位置 */
                 }
 
                 /* Must be adjacent. */
                 ASSERT_SEQUENTIAL(arp_sha, arp_tha);
 
-                arp_buf[0] = arp->ar_sha;
-                arp_buf[1] = arp->ar_tha;
+                arp_buf[0] = arp->ar_sha;          /* ARP 发送方 MAC → arp_sha */
+                arp_buf[1] = arp->ar_tha;          /* ARP 目标 MAC → arp_tha */
                 miniflow_push_macs(mf, arp_sha, arp_buf);
                 miniflow_pad_to_64(mf, arp_tha);
             }
         } else if (dl_type == htons(ETH_TYPE_NSH)) {
+            /* --- NSH（Network Service Header，SFC 服务链）--- */
             struct ovs_key_nsh nsh;
 
             if (OVS_LIKELY(parse_nsh(&data, &size, &nsh))) {
                 miniflow_push_words(mf, nsh, &nsh,
                                     sizeof(struct ovs_key_nsh) /
-                                    sizeof(uint64_t));
+                                    sizeof(uint64_t));     /* 推入完整 NSH 字段 */
             }
         }
-        goto out;
+        goto out;                                  /* 非 IP 包：无 L4，直接结束 */
     }
 
-    packet->l4_ofs = (char *)data - frame;
+    /* ================================================================
+     * 第4段：L4（传输层）提取
+     * 包含 TCP/UDP/SCTP/ICMP/ICMPv6 的端口/类型/标志位。
+     * ================================================================ */
+
+    packet->l4_ofs = (char *)data - frame;         /* 记录 L4 层偏移 */
+    /* 将 nw_frag/nw_tos/nw_ttl/nw_proto 打包为一个 32 位值推入 miniflow。
+     * 对应 struct flow 中 nw_frag~nw_proto 四个字节连续排列的布局。 */
     miniflow_push_be32(mf, nw_frag,
                        bytes_to_be32(nw_frag, nw_tos, nw_ttl, nw_proto));
 
+    /* 仅对非分片后续包解析 L4（分片后续包无 L4 头） */
     if (OVS_LIKELY(!(nw_frag & FLOW_NW_FRAG_LATER))) {
         if (OVS_LIKELY(nw_proto == IPPROTO_TCP)) {
+            /* --- TCP（最常见的 L4 协议）--- */
             if (OVS_LIKELY(size >= TCP_HEADER_LEN)) {
                 const struct tcp_header *tcp = data;
-                size_t tcp_hdr_len = TCP_OFFSET(tcp->tcp_ctl) * 4;
+                size_t tcp_hdr_len = TCP_OFFSET(tcp->tcp_ctl) * 4; /* TCP 头长度 */
 
                 if (OVS_LIKELY(tcp_hdr_len >= TCP_HEADER_LEN)
                     && OVS_LIKELY(size >= tcp_hdr_len)) {
                     /* tcp_flags are not at the beginning of the block. */
-                    miniflow_pad_from_64(mf, tcp_flags);
+                    miniflow_pad_from_64(mf, tcp_flags);   /* 跳过 nd_target/arp_sha/arp_tha */
                     miniflow_push_be32(mf, tcp_flags,
-                                       TCP_FLAGS_BE32(tcp->tcp_ctl));
-                    miniflow_push_be16(mf, tp_src, tcp->tcp_src);
-                    miniflow_push_be16(mf, tp_dst, tcp->tcp_dst);
-                    miniflow_push_be16(mf, ct_tp_src, ct_tp_src);
-                    miniflow_push_be16(mf, ct_tp_dst, ct_tp_dst);
+                                       TCP_FLAGS_BE32(tcp->tcp_ctl)); /* TCP 标志位（SYN/ACK/...） */
+                    miniflow_push_be16(mf, tp_src, tcp->tcp_src);     /* TCP 源端口 */
+                    miniflow_push_be16(mf, tp_dst, tcp->tcp_dst);     /* TCP 目的端口 */
+                    miniflow_push_be16(mf, ct_tp_src, ct_tp_src);     /* conntrack 源端口 */
+                    miniflow_push_be16(mf, ct_tp_dst, ct_tp_dst);     /* conntrack 目的端口 */
+                    /* 更新 RSS 哈希（用于多队列网卡的包分发验证） */
                     if (dl_type == htons(ETH_TYPE_IP)) {
                         dp_packet_update_rss_hash_ipv4_tcp_udp(packet);
                     } else if (dl_type == htons(ETH_TYPE_IPV6)) {
                         dp_packet_update_rss_hash_ipv6_tcp_udp(packet);
                     }
-                    dp_packet_l4_proto_set_tcp(packet);
+                    dp_packet_l4_proto_set_tcp(packet);    /* 标记 L4 协议为 TCP */
                 }
             }
         } else if (OVS_LIKELY(nw_proto == IPPROTO_UDP)) {
+            /* --- UDP --- */
             if (OVS_LIKELY(size >= UDP_HEADER_LEN)) {
                 const struct udp_header *udp = data;
 
-                miniflow_push_be16(mf, tp_src, udp->udp_src);
-                miniflow_push_be16(mf, tp_dst, udp->udp_dst);
+                miniflow_push_be16(mf, tp_src, udp->udp_src);     /* UDP 源端口 */
+                miniflow_push_be16(mf, tp_dst, udp->udp_dst);     /* UDP 目的端口 */
                 miniflow_push_be16(mf, ct_tp_src, ct_tp_src);
                 miniflow_push_be16(mf, ct_tp_dst, ct_tp_dst);
                 if (dl_type == htons(ETH_TYPE_IP)) {
@@ -1080,59 +1157,66 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
                 dp_packet_l4_proto_set_udp(packet);
             }
         } else if (OVS_LIKELY(nw_proto == IPPROTO_SCTP)) {
+            /* --- SCTP --- */
             if (OVS_LIKELY(size >= SCTP_HEADER_LEN)) {
                 const struct sctp_header *sctp = data;
 
-                miniflow_push_be16(mf, tp_src, sctp->sctp_src);
-                miniflow_push_be16(mf, tp_dst, sctp->sctp_dst);
+                miniflow_push_be16(mf, tp_src, sctp->sctp_src);   /* SCTP 源端口 */
+                miniflow_push_be16(mf, tp_dst, sctp->sctp_dst);   /* SCTP 目的端口 */
                 miniflow_push_be16(mf, ct_tp_src, ct_tp_src);
                 miniflow_push_be16(mf, ct_tp_dst, ct_tp_dst);
                 dp_packet_l4_proto_set_sctp(packet);
             }
         } else if (OVS_LIKELY(nw_proto == IPPROTO_ICMP)) {
+            /* --- ICMPv4 --- */
             if (OVS_LIKELY(size >= ICMP_HEADER_LEN)) {
                 const struct icmp_header *icmp = data;
 
-                miniflow_push_be16(mf, tp_src, htons(icmp->icmp_type));
-                miniflow_push_be16(mf, tp_dst, htons(icmp->icmp_code));
+                miniflow_push_be16(mf, tp_src, htons(icmp->icmp_type)); /* ICMP 类型 → tp_src */
+                miniflow_push_be16(mf, tp_dst, htons(icmp->icmp_code)); /* ICMP 代码 → tp_dst */
                 miniflow_push_be16(mf, ct_tp_src, ct_tp_src);
                 miniflow_push_be16(mf, ct_tp_dst, ct_tp_dst);
             }
         } else if (OVS_LIKELY(nw_proto == IPPROTO_IGMP)) {
+            /* --- IGMP（组播组管理）--- */
             if (OVS_LIKELY(size >= IGMP_HEADER_LEN)) {
                 const struct igmp_header *igmp = data;
 
-                miniflow_push_be16(mf, tp_src, htons(igmp->igmp_type));
-                miniflow_push_be16(mf, tp_dst, htons(igmp->igmp_code));
+                miniflow_push_be16(mf, tp_src, htons(igmp->igmp_type)); /* IGMP 类型 */
+                miniflow_push_be16(mf, tp_dst, htons(igmp->igmp_code)); /* IGMP 代码 */
                 /* ct_tp_src/dst are not extracted for IGMP. */
-                miniflow_pad_to_64(mf, tp_dst);
+                miniflow_pad_to_64(mf, tp_dst);            /* IGMP 不提取 ct 端口，填充对齐 */
                 miniflow_push_be32(mf, igmp_group_ip4,
-                                   get_16aligned_be32(&igmp->group));
+                                   get_16aligned_be32(&igmp->group)); /* IGMP 组播组地址 */
                 miniflow_pad_to_64(mf, igmp_group_ip4);
             }
         } else if (OVS_LIKELY(nw_proto == IPPROTO_ICMPV6)) {
+            /* --- ICMPv6（含邻居发现 ND）--- */
             if (OVS_LIKELY(size >= sizeof(struct icmp6_data_header))) {
                 const union ovs_16aligned_in6_addr *nd_target;
                 struct eth_addr arp_buf[2];
                 /* This will populate whether we received Option 1
                  * or Option 2. */
-                uint8_t opt_type;
+                uint8_t opt_type;                  /* ND 选项类型（1=源链路层地址, 2=目标链路层地址） */
                 /* This holds the ND Reserved field. */
-                ovs_be32 rso_flags;
+                ovs_be32 rso_flags;                /* ND 的 R/S/O 标志位 + 保留字段 */
                 const struct icmp6_data_header *icmp6;
 
                 icmp6 = data_pull(&data, &size, sizeof *icmp6);
                 if (parse_icmpv6(&data, &size, icmp6,
                                  &rso_flags, &nd_target, arp_buf, &opt_type)) {
+                    /* === ICMPv6 邻居发现（NS/NA）=== */
                     if (nd_target) {
                         miniflow_push_words(mf, nd_target, nd_target,
-                                            sizeof *nd_target / sizeof(uint64_t));
+                                            sizeof *nd_target / sizeof(uint64_t)); /* ND 目标地址 */
                     }
-                    miniflow_push_macs(mf, arp_sha, arp_buf);
+                    miniflow_push_macs(mf, arp_sha, arp_buf); /* ND 源/目标链路层地址
+                                                                * 复用 arp_sha/arp_tha 字段 */
                     /* Populate options field and set the padding
                      * accordingly. */
                     if (opt_type != 0) {
                         miniflow_push_be16(mf, tcp_flags, htons(opt_type));
+                                                   /* ND 选项类型存入 tcp_flags 字段 */
                         /* Pad to align with 64 bits.
                          * This will zero out the pad3 field. */
                         miniflow_pad_to_64(mf, tcp_flags);
@@ -1142,15 +1226,17 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
                         miniflow_pad_to_64(mf, arp_tha);
                     }
                     miniflow_push_be16(mf, tp_src,
-                                       htons(icmp6->icmp6_base.icmp6_type));
+                                       htons(icmp6->icmp6_base.icmp6_type)); /* ICMPv6 类型 */
                     miniflow_push_be16(mf, tp_dst,
-                                       htons(icmp6->icmp6_base.icmp6_code));
+                                       htons(icmp6->icmp6_base.icmp6_code)); /* ICMPv6 代码 */
                     miniflow_pad_to_64(mf, tp_dst);
                     /* Fill ND reserved field. */
                     miniflow_push_be32(mf, igmp_group_ip4, rso_flags);
+                                                   /* ND R/S/O 标志存入 igmp_group_ip4 字段 */
                     miniflow_pad_to_64(mf, igmp_group_ip4);
                 } else {
                     /* ICMPv6 but not ND. */
+                    /* === 普通 ICMPv6（非 ND）=== */
                     miniflow_push_be16(mf, tp_src,
                                        htons(icmp6->icmp6_base.icmp6_type));
                     miniflow_push_be16(mf, tp_dst,
@@ -1166,11 +1252,16 @@ miniflow_extract(struct dp_packet *packet, struct miniflow *dst)
                 *ct_nw_proto_p == IPPROTO_SCTP ||
                 *ct_nw_proto_p == IPPROTO_ICMP ||
                 (*ct_nw_proto_p == IPPROTO_ICMPV6 && !icmp6_is_nd(data)))) {
+        /* === 分片后续包 但有 conntrack 原始元组端口 ===
+         * 虽然 L4 头不可用（分片后续包），但 conntrack 的原始元组端口
+         * 来自元数据而非数据包本身，仍然需要推入 miniflow。 */
         miniflow_pad_from_64(mf, ct_tp_src);
         miniflow_push_be16(mf, ct_tp_src, ct_tp_src);
         miniflow_push_be16(mf, ct_tp_dst, ct_tp_dst);
     }
  out:
+    /* 最终：将构建好的位图赋值给 miniflow。
+     * 至此 miniflow 构建完成，包含了从此数据包中提取的所有非零字段。 */
     dst->map = mf.map;
 }
 
@@ -1194,90 +1285,125 @@ parse_dl_type(const void **datap, size_t *sizep, ovs_be16 *first_vlan_tci_p)
  *
  * The caller must ensure that 'packet' is at least ETH_HEADER_LEN bytes
  * long.'*/
+/* 轻量级数据包解析函数 — 快速提取 TCP 标志位，同时顺便输出 dl_type/nw_frag/vlan_tci。
+ *
+ * 与 miniflow_extract() 相比，此函数不构建完整的 miniflow，
+ * 仅做最小程度的 L2→L3→L4 解析以获取 TCP flags。
+ * 主要用于 dfc_processing() 中 simple_match 优化路径：
+ *   需要 dl_type/nw_frag/vlan_tci 这三个字段来构造 simple_match_mark，
+ *   同时返回 TCP flags 用于统计更新。
+ *
+ * 解析流程：
+ *   1. 检查是否以太网包
+ *   2. 解析 L2 头（跳过 VLAN/MPLS）→ 得到 dl_type
+ *   3. 解析 L3 头（IPv4 或 IPv6）→ 得到 nw_proto, nw_frag
+ *   4. 若非分片后续包，检查 L4 是否为 TCP → 返回 TCP flags
+ *
+ * 返回值：TCP 标志位（主机字节序），非 TCP 包返回 0。 */
 uint16_t
 parse_tcp_flags(struct dp_packet *packet,
                 ovs_be16 *dl_type_p, uint8_t *nw_frag_p,
                 ovs_be16 *first_vlan_tci_p)
 {
-    const void *data = dp_packet_data(packet);
-    const char *frame = (const char *)data;
-    size_t size = dp_packet_size(packet);
-    ovs_be16 dl_type;
-    uint8_t nw_frag = 0, nw_proto = 0;
+    const void *data = dp_packet_data(packet);   /* 指向包数据起始位置（以太网头） */
+    const char *frame = (const char *)data;      /* 保存帧起始地址，用于计算各层偏移 */
+    size_t size = dp_packet_size(packet);         /* 包的总字节数 */
+    ovs_be16 dl_type;                            /* 以太网类型（如 0x0800=IPv4） */
+    uint8_t nw_frag = 0, nw_proto = 0;          /* IP 分片标志 和 协议号 */
 
+    /* 非以太网包（如纯 L3 包）不处理，直接返回 0 */
     if (!dp_packet_is_eth(packet)) {
         return 0;
     }
 
+    /* 重置包的各层偏移量（l2_5_ofs, l3_ofs, l4_ofs 等） */
     dp_packet_reset_offsets(packet);
 
+    /* === 第1步：解析 L2 头 ===
+     * 跳过以太网头和可能的 VLAN 标签，提取 EtherType。
+     * 同时输出第一个 VLAN TCI 到 first_vlan_tci_p。
+     * 解析后 data 指针前移到 L3 头起始位置。 */
     dl_type = parse_dl_type(&data, &size, first_vlan_tci_p);
     if (dl_type_p) {
-        *dl_type_p = dl_type;
+        *dl_type_p = dl_type;                    /* 输出以太网类型给调用者 */
     }
     if (OVS_UNLIKELY(eth_type_mpls(dl_type))) {
-        packet->l2_5_ofs = (char *)data - frame;
+        packet->l2_5_ofs = (char *)data - frame; /* MPLS 包：记录 L2.5 偏移 */
     }
-    packet->l3_ofs = (char *)data - frame;
-    if (OVS_LIKELY(dl_type == htons(ETH_TYPE_IP))) {
-        const struct ip_header *nh = data;
-        int ip_len;
-        uint16_t tot_len;
+    packet->l3_ofs = (char *)data - frame;       /* 记录 L3 层偏移量 */
 
+    /* === 第2步：解析 L3 头 === */
+    if (OVS_LIKELY(dl_type == htons(ETH_TYPE_IP))) {
+        /* --- IPv4 路径（常见路径，用 OVS_LIKELY 优化分支预测）--- */
+        const struct ip_header *nh = data;
+        int ip_len;                              /* IP 头长度（含选项） */
+        uint16_t tot_len;                        /* IP 总长度 */
+
+        /* 校验 IPv4 头的合法性（版本、长度、校验和等） */
         if (OVS_UNLIKELY(!ipv4_sanity_check(nh, size, &ip_len, &tot_len))) {
             if (OVS_UNLIKELY(VLOG_IS_DBG_ENABLED())) {
                 dump_invalid_packet(packet, "ipv4_sanity_check");
             }
-            return 0;
+            return 0;                            /* 非法 IPv4 包，放弃解析 */
         }
-        dp_packet_set_l2_pad_size(packet, size - tot_len);
-        nw_proto = nh->ip_proto;
-        nw_frag = ipv4_get_nw_frag(nh);
+        dp_packet_set_l2_pad_size(packet, size - tot_len); /* 记录 L2 填充大小 */
+        nw_proto = nh->ip_proto;                 /* 提取上层协议号（6=TCP, 17=UDP） */
+        nw_frag = ipv4_get_nw_frag(nh);          /* 提取分片标志（MF/offset） */
 
-        size = tot_len;   /* Never pull padding. */
-        data_pull(&data, &size, ip_len);
+        size = tot_len;   /* Never pull padding. */  /* 用 IP 总长度替代帧长度，排除填充 */
+        data_pull(&data, &size, ip_len);         /* 跳过 IP 头，data 指向 L4 */
     } else if (dl_type == htons(ETH_TYPE_IPV6)) {
+        /* --- IPv6 路径 --- */
         const struct ovs_16aligned_ip6_hdr *nh = data;
-        uint16_t plen;
+        uint16_t plen;                           /* IPv6 载荷长度 */
 
+        /* 校验 IPv6 头的合法性 */
         if (OVS_UNLIKELY(!ipv6_sanity_check(nh, size))) {
             if (OVS_UNLIKELY(VLOG_IS_DBG_ENABLED())) {
                 dump_invalid_packet(packet, "ipv6_sanity_check");
             }
-            return 0;
+            return 0;                            /* 非法 IPv6 包，放弃解析 */
         }
-        data_pull(&data, &size, sizeof *nh);
+        data_pull(&data, &size, sizeof *nh);     /* 跳过 IPv6 固定头（40 字节） */
 
-        plen = ntohs(nh->ip6_plen); /* Never pull padding. */
+        plen = ntohs(nh->ip6_plen); /* Never pull padding. */  /* 载荷长度（不含固定头） */
         dp_packet_set_l2_pad_size(packet, size - plen);
         size = plen;
-        nw_proto = nh->ip6_nxt;
+        nw_proto = nh->ip6_nxt;                  /* 下一个头类型（可能是扩展头） */
+        /* 遍历 IPv6 扩展头链，最终得到真正的上层协议号和分片标志 */
         if (!parse_ipv6_ext_hdrs(&data, &size, &nw_proto, &nw_frag,
                                  NULL, NULL)) {
-            return 0;
+            return 0;                            /* 扩展头解析失败 */
         }
     } else {
+        /* 非 IP 包（如 ARP/LLDP），无 TCP flags 可提取 */
         return 0;
     }
 
+    /* 输出 IP 分片标志给调用者 */
     if (nw_frag_p) {
         *nw_frag_p = nw_frag;
     }
 
-    packet->l4_ofs = (uint16_t)((char *)data - frame);
+    /* === 第3步：解析 L4 头 === */
+    packet->l4_ofs = (uint16_t)((char *)data - frame);  /* 记录 L4 层偏移量 */
+    /* 仅对非分片后续包（首片或完整包）解析 L4。
+     * FLOW_NW_FRAG_LATER 表示分片偏移 > 0，此时无 L4 头。 */
     if (!(nw_frag & FLOW_NW_FRAG_LATER)) {
         if (nw_proto == IPPROTO_TCP && size >= TCP_HEADER_LEN) {
+            /* TCP 包：提取 TCP 控制字段中的标志位（SYN/ACK/FIN/RST 等） */
             const struct tcp_header *tcp = data;
 
-            dp_packet_l4_proto_set_tcp(packet);
-            return TCP_FLAGS(tcp->tcp_ctl);
+            dp_packet_l4_proto_set_tcp(packet);  /* 标记包的 L4 协议为 TCP */
+            return TCP_FLAGS(tcp->tcp_ctl);      /* 返回 TCP flags（主机字节序） */
         } else if (nw_proto == IPPROTO_UDP && size >= UDP_HEADER_LEN) {
-            dp_packet_l4_proto_set_udp(packet);
+            dp_packet_l4_proto_set_udp(packet);  /* 标记 L4 协议为 UDP */
         } else if (nw_proto == IPPROTO_SCTP && size >= SCTP_HEADER_LEN) {
-            dp_packet_l4_proto_set_sctp(packet);
+            dp_packet_l4_proto_set_sctp(packet); /* 标记 L4 协议为 SCTP */
         }
     }
 
+    /* 非 TCP 包（UDP/SCTP/ICMP/分片等）返回 0 */
     return 0;
 }
 

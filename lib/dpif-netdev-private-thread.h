@@ -56,6 +56,42 @@ struct dp_netdev_pmd_thread_ctx {
     bool smc_enable_db;
 };
 
+/* @veencn_260223: Per-stage latency statistics for datapath profiling.
+ * Only written by the owning PMD thread; may be read from any thread. */
+
+#define LATENCY_HIST_BUCKETS 7
+/* Histogram bucket boundaries (nanoseconds):
+ * [0] <100ns  [1] 100-200ns  [2] 200-500ns  [3] 500ns-1us
+ * [4] 1-10us  [5] 10-100us   [6] >=100us */
+
+struct latency_stage_stats {
+    uint64_t count;
+    uint64_t total_cycles;
+    uint64_t min_cycles;        /* Init to UINT64_MAX. */
+    uint64_t max_cycles;
+    uint64_t histogram[LATENCY_HIST_BUCKETS];
+};
+
+struct pmd_latency_stats {
+    bool enabled;
+
+    /* Per-stage latency. */
+    struct latency_stage_stats miniflow;       /* miniflow extract */
+    struct latency_stage_stats emc_lookup;     /* EMC hit lookup */
+    struct latency_stage_stats smc_lookup;     /* SMC hit lookup */
+    struct latency_stage_stats dpcls_lookup;   /* megaflow lookup */
+    struct latency_stage_stats upcall;         /* upcall slow path */
+    struct latency_stage_stats action_exec;    /* action execution */
+    struct latency_stage_stats total;          /* rx to action done */
+
+    /* Hit path counters. */
+    uint64_t emc_hit_count;
+    uint64_t smc_hit_count;
+    uint64_t dpcls_hit_count;
+    uint64_t upcall_count;
+};
+/* @veencn_260223 end */
+
 /* PMD: Poll modes drivers.  PMD accesses devices via polling to eliminate
  * the performance overhead of interrupt processing.  Therefore netdev can
  * not implement rx-wait for these devices.  dpif-netdev needs to poll
@@ -218,6 +254,9 @@ struct dp_netdev_pmd_thread {
 
     /* Keep track of detailed PMD performance statistics. */
     struct pmd_perf_stats perf_stats;
+
+    /* @veencn_260223: Per-stage latency measurement. */
+    struct pmd_latency_stats latency_stats;
 
     /* Stats from previous iteration used by automatic pmd
      * load balance logic. */
