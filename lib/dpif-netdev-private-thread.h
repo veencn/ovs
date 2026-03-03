@@ -76,21 +76,80 @@ struct pmd_latency_stats {
     bool enabled;
 
     /* Per-stage latency. */
+    struct latency_stage_stats phwol_lookup;   /* PHWOL hw offload */
+    struct latency_stage_stats simple_match;   /* simple match */
     struct latency_stage_stats miniflow;       /* miniflow extract */
     struct latency_stage_stats emc_lookup;     /* EMC hit lookup */
     struct latency_stage_stats smc_lookup;     /* SMC hit lookup */
     struct latency_stage_stats dpcls_lookup;   /* megaflow lookup */
     struct latency_stage_stats upcall;         /* upcall slow path */
+    struct latency_stage_stats conntrack;      /* conntrack execution */
+    struct latency_stage_stats tnl_push;       /* tunnel push */
+    struct latency_stage_stats tnl_pop;        /* tunnel pop */
     struct latency_stage_stats action_exec;    /* action execution */
     struct latency_stage_stats total;          /* rx to action done */
 
     /* Hit path counters. */
+    uint64_t phwol_hit_count;
+    uint64_t simple_hit_count;
     uint64_t emc_hit_count;
     uint64_t smc_hit_count;
     uint64_t dpcls_hit_count;
     uint64_t upcall_count;
+    uint64_t conntrack_count;
+    uint64_t recirc_count;
 };
 /* @veencn_260223 end */
+
+/* @veencn: Per-packet trace — 记录单包经过各处理阶段的 TSC 时间戳。
+ * 仅 owning PMD 线程写入；appctl 回调线程读取，不加锁。 */
+
+enum pkt_trace_stage {
+    TRACE_RX = 0,        /* 收包入口 */
+    TRACE_PHWOL,         /* PHWOL 硬件卸载命中 */
+    TRACE_SIMPLE_MATCH,  /* Simple Match 快路径命中 */
+    TRACE_MINIFLOW,      /* miniflow_extract 完成 */
+    TRACE_EMC,           /* EMC 命中 */
+    TRACE_SMC,           /* SMC 命中 */
+    TRACE_DPCLS,         /* dpcls 命中 */
+    TRACE_UPCALL,        /* upcall 完成 */
+    TRACE_CONNTRACK,     /* conntrack 执行完成 */
+    TRACE_TNL_PUSH,      /* tunnel push 完成 */
+    TRACE_TNL_POP,       /* tunnel pop 完成 */
+    TRACE_ACTION,        /* action 执行完成 */
+    TRACE_RECIRC,        /* recirculation 入口 */
+    TRACE_TX,            /* 发包出口 */
+    TRACE_N_STAGES
+};
+
+#define PKT_TRACE_RING_SIZE 64
+
+struct pkt_trace_entry {
+    bool valid;                    /* 此条目是否有效 */
+    /* 包标识信息 */
+    struct eth_addr dl_src;
+    struct eth_addr dl_dst;
+    ovs_be16 dl_type;
+    ovs_be32 nw_src;
+    ovs_be32 nw_dst;
+    uint8_t nw_proto;
+    uint8_t nw_ttl;
+    ovs_be16 tp_src;
+    ovs_be16 tp_dst;
+    odp_port_t in_port;
+    odp_port_t out_port;           /* TX 时记录 */
+    uint32_t recirc_id;            /* recirculation ID（0=首次） */
+    /* 各阶段 TSC 时间戳（0 = 未经过该阶段） */
+    uint64_t ts[TRACE_N_STAGES];
+};
+
+struct pkt_trace_state {
+    bool enabled;
+    uint32_t write_idx;            /* 下一个写入位置（环形） */
+    uint32_t total_traced;         /* 累计追踪的包数 */
+    struct pkt_trace_entry ring[PKT_TRACE_RING_SIZE];
+};
+/* @veencn end: per-packet trace */
 
 /* PMD: Poll modes drivers.  PMD accesses devices via polling to eliminate
  * the performance overhead of interrupt processing.  Therefore netdev can
@@ -257,6 +316,9 @@ struct dp_netdev_pmd_thread {
 
     /* @veencn_260223: Per-stage latency measurement. */
     struct pmd_latency_stats latency_stats;
+
+    /* @veencn: Per-packet trace ring buffer. */
+    struct pkt_trace_state trace;
 
     /* Stats from previous iteration used by automatic pmd
      * load balance logic. */

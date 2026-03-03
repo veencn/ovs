@@ -133,6 +133,7 @@ struct dp_packet {
     enum dp_packet_source source;  /* Source of memory allocated as 'base'. */
     bool has_hash;                 /* Is the 'rss_hash' valid? */
     bool has_mark;                 /* Is the 'flow_mark' valid? */
+    uint16_t trace_idx;            /* @veencn: 0=not traced, 1..N=ring[idx-1] */
 
     /* All the following elements of this struct are copied in a single call
      * of memcpy in dp_packet_clone_with_headroom. */
@@ -172,6 +173,19 @@ static inline void
 dp_packet_set_rx_tsc(struct dp_packet *p, uint64_t tsc)
 {
     p->rx_tsc = tsc;
+}
+
+/* @veencn: Per-packet trace index accessors. */
+static inline uint16_t
+dp_packet_get_trace_idx(const struct dp_packet *p)
+{
+    return p->trace_idx;
+}
+
+static inline void
+dp_packet_set_trace_idx(struct dp_packet *p, uint16_t idx)
+{
+    p->trace_idx = idx;
 }
 
 #if HAVE_AF_XDP
