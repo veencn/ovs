@@ -23,6 +23,7 @@
 #include "coverage.h"
 #include "cmap.h"
 #include "lib/dpif-provider.h"
+#include "lib/dpif-netdev.h"        /* @veencn: pkt_trace_mark_stage */
 #include "dpif.h"
 #include "dpif-offload.h"
 #include "openvswitch/dynamic-string.h"
@@ -1465,6 +1466,7 @@ out:
         upcall.ukey_persists = true;
     }
     upcall_uninit(&upcall);
+    pkt_trace_mark_stage(PKT_TRACE_STAGE_UPCALL_XLATE);  /* @veencn */
     return error;
 }
 

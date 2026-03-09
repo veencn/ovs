@@ -47,11 +47,11 @@ static struct vlog_rate_limit latency_rl = VLOG_RATE_LIMIT_INIT(600, 600);
 
 static uint64_t tsc_hz = 1;
 
-/* @veencn_260223: Expose TSC frequency for latency measurement. */
+/* @veencn: Convert CPU clock cycles to nanoseconds using cached TSC frequency. */
 uint64_t
-pmd_perf_get_tsc_hz(void)
+pmd_perf_cycles_to_ns(uint64_t cycles)
 {
-    return tsc_hz;
+    return tsc_hz > 1 ? cycles * 1000000000ULL / tsc_hz : 0;
 }
 
 void

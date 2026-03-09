@@ -301,8 +301,8 @@ cycle_timer_stop(struct pmd_perf_stats *s,
     return now - timer->start;
 }
 
-/* @veencn_260223: Get TSC frequency for cycle-to-nanosecond conversion. */
-uint64_t pmd_perf_get_tsc_hz(void);
+/* @veencn: Convert CPU clock cycles to nanoseconds using cached TSC frequency. */
+uint64_t pmd_perf_cycles_to_ns(uint64_t cycles);
 
 /* Functions to initialize and reset the PMD performance metrics. */
 

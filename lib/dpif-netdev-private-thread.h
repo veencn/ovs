@@ -112,10 +112,16 @@ enum pkt_trace_stage {
     TRACE_EMC,           /* EMC 命中 */
     TRACE_SMC,           /* SMC 命中 */
     TRACE_DPCLS,         /* dpcls 命中 */
-    TRACE_UPCALL,        /* upcall 完成 */
+    /* @veencn: upcall 细化 */
+    TRACE_UPCALL_XLATE,      /* xlate_actions 完成（含 upcall_receive + xlate + ukey） */
+    TRACE_UPCALL_EXEC,       /* upcall 路径的 action 执行完成 */
+    TRACE_UPCALL_FLOW_INST,  /* flow_add + emc/smc_insert 完成 */
+    TRACE_UPCALL,            /* upcall 整体完成 */
+    /* action 细化 */
     TRACE_CONNTRACK,     /* conntrack 执行完成 */
     TRACE_TNL_PUSH,      /* tunnel push 完成 */
     TRACE_TNL_POP,       /* tunnel pop 完成 */
+    TRACE_OUTPUT_ACTION,      /* @veencn: output action 入 tx batch */
     TRACE_ACTION,        /* action 执行完成 */
     TRACE_RECIRC,        /* recirculation 入口 */
     TRACE_TX,            /* 发包出口 */
@@ -124,18 +130,15 @@ enum pkt_trace_stage {
 
 #define PKT_TRACE_RING_SIZE 64
 
+/* @veencn: 用 memcpy 快照替代逐字段包头提取，降低热路径开销。
+ * 显示端用 flow_extract() + flow_format() 从快照中完整解析。 */
+#define PKT_TRACE_HDR_SNAP_SIZE 128
+
 struct pkt_trace_entry {
     bool valid;                    /* 此条目是否有效 */
-    /* 包标识信息 */
-    struct eth_addr dl_src;
-    struct eth_addr dl_dst;
-    ovs_be16 dl_type;
-    ovs_be32 nw_src;
-    ovs_be32 nw_dst;
-    uint8_t nw_proto;
-    uint8_t nw_ttl;
-    ovs_be16 tp_src;
-    ovs_be16 tp_dst;
+    /* @veencn: 原始包头快照（一次 memcpy 替代逐字段提取） */
+    uint16_t hdr_snap_len;                          /* 实际快照长度 */
+    uint8_t hdr_snap[PKT_TRACE_HDR_SNAP_SIZE];      /* L2+L3+L4 原始字节 */
     odp_port_t in_port;
     odp_port_t out_port;           /* TX 时记录 */
     uint32_t recirc_id;            /* recirculation ID（0=首次） */
