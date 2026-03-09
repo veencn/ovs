@@ -48,6 +48,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>                /* @veencn: for CT mmap dump/restore */
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -56,6 +57,7 @@
 #include "ccmap.h"
 #include "cmap.h"
 #include "conntrack.h"
+#include "conntrack-private.h"       /* @veencn: for CT restore structs */
 #include "conntrack-tp.h"
 #include "coverage.h"
 #include "ct-dpif.h"
@@ -2633,6 +2635,250 @@ dpif_netdev_pkt_trace_set(struct unixctl_conn *conn,
 }
 /* @veencn end: per-packet trace appctl callbacks */
 
+/* @veencn: CT dump-to-file handler for Phase 1 hot upgrade.
+ * Dumps all CT entries to a binary mmap file. */
+static void
+dpif_netdev_ct_dump_to_file(struct unixctl_conn *conn,
+                            int argc, const char *argv[],
+                            void *aux OVS_UNUSED)
+{
+    const char *path = argv[1];
+    struct dp_netdev *dp = NULL;
+    uint16_t zone_val = 0;
+    uint16_t *pzone = NULL;
+
+    /* Parse optional args: [-zone N] [dp] */
+    for (int i = 2; i < argc; i++) {
+        if (!strcmp(argv[i], "-zone") && i + 1 < argc) {
+            zone_val = atoi(argv[++i]);
+            pzone = &zone_val;
+        } else {
+            ovs_mutex_lock(&dp_netdev_mutex);
+            dp = shash_find_data(&dp_netdevs, argv[i]);
+            ovs_mutex_unlock(&dp_netdev_mutex);
+        }
+    }
+
+    ovs_mutex_lock(&dp_netdev_mutex);
+    if (!dp) {
+        if (shash_count(&dp_netdevs) == 1) {
+            dp = shash_first(&dp_netdevs)->data;
+        } else {
+            ovs_mutex_unlock(&dp_netdev_mutex);
+            unixctl_command_reply_error(conn,
+                "please specify an existing datapath");
+            return;
+        }
+    }
+
+    struct conntrack *ct = dp->conntrack;
+    ovs_mutex_unlock(&dp_netdev_mutex);
+
+    /* Use conntrack_dump directly for full-fidelity dump. */
+    struct conntrack_dump dump;
+    struct ct_dump_entry entry;
+    int tot_bkts;
+
+    /* First pass: count. */
+    conntrack_dump_start(ct, &dump, pzone, &tot_bkts);
+    uint64_t count = 0;
+    while (!conntrack_dump_next_full(&dump, &entry)) {
+        count++;
+    }
+    conntrack_dump_done(&dump);
+
+    if (count == 0) {
+        unixctl_command_reply(conn, "[NDU] CT dump: 0 entries\n");
+        return;
+    }
+
+    /* Allocate mmap file with headroom. */
+    uint64_t capacity = count + count / 10 + 64;
+    size_t file_size = sizeof(struct ct_dump_file_header)
+                     + capacity * sizeof(struct ct_dump_entry);
+
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        unixctl_command_reply_error(conn, ovs_strerror(errno));
+        return;
+    }
+    if (ftruncate(fd, file_size) < 0) {
+        close(fd);
+        unixctl_command_reply_error(conn, ovs_strerror(errno));
+        return;
+    }
+    void *base = mmap(NULL, file_size, PROT_READ | PROT_WRITE,
+                       MAP_SHARED, fd, 0);
+    if (base == MAP_FAILED) {
+        close(fd);
+        unixctl_command_reply_error(conn, ovs_strerror(errno));
+        return;
+    }
+
+    struct ct_dump_file_header *hdr = base;
+    hdr->magic = CT_DUMP_MAGIC;
+    hdr->version = CT_DUMP_VERSION;
+    hdr->entry_size = sizeof(struct ct_dump_entry);
+    hdr->timestamp_ms = time_msec();
+    hdr->n_entries = 0;
+
+    struct ct_dump_entry *entries =
+        (void *)((char *)base + sizeof(struct ct_dump_file_header));
+
+    /* Second pass: fill. */
+    conntrack_dump_start(ct, &dump, pzone, &tot_bkts);
+    uint64_t idx = 0;
+    while (!conntrack_dump_next_full(&dump, &entry) && idx < capacity) {
+        memcpy(&entries[idx], &entry, sizeof entry);
+        idx++;
+    }
+    conntrack_dump_done(&dump);
+
+    hdr->n_entries = idx;
+    size_t actual_size = sizeof(struct ct_dump_file_header)
+                       + idx * sizeof(struct ct_dump_entry);
+    msync(base, actual_size, MS_SYNC);
+    munmap(base, file_size);
+    ovs_ignore(ftruncate(fd, actual_size));
+    close(fd);
+
+    struct ds reply = DS_EMPTY_INITIALIZER;
+    ds_put_format(&reply,
+                  "[NDU] CT dump: %"PRIu64" entries -> %s (%.1f KB)\n",
+                  idx, path, actual_size / 1024.0);
+    unixctl_command_reply(conn, ds_cstr(&reply));
+    ds_destroy(&reply);
+}
+
+/* @veencn: CT restore-from-file handler for Phase 1 hot upgrade.
+ * Restores CT entries from a binary mmap file. */
+static void
+dpif_netdev_ct_restore_from_file(struct unixctl_conn *conn,
+                                 int argc, const char *argv[],
+                                 void *aux OVS_UNUSED)
+{
+    const char *path = argv[1];
+    struct dp_netdev *dp = NULL;
+
+    ovs_mutex_lock(&dp_netdev_mutex);
+    if (argc >= 3) {
+        dp = shash_find_data(&dp_netdevs, argv[2]);
+    } else if (shash_count(&dp_netdevs) == 1) {
+        dp = shash_first(&dp_netdevs)->data;
+    }
+
+    if (!dp) {
+        ovs_mutex_unlock(&dp_netdev_mutex);
+        unixctl_command_reply_error(conn,
+            "please specify an existing datapath");
+        return;
+    }
+
+    struct conntrack *ct = dp->conntrack;
+    ovs_mutex_unlock(&dp_netdev_mutex);
+
+    /* Open and validate mmap file. */
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        unixctl_command_reply_error(conn, ovs_strerror(errno));
+        return;
+    }
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        unixctl_command_reply_error(conn, ovs_strerror(errno));
+        return;
+    }
+
+    size_t file_size = st.st_size;
+    if (file_size < sizeof(struct ct_dump_file_header)) {
+        close(fd);
+        unixctl_command_reply_error(conn, "file too small");
+        return;
+    }
+
+    void *base = mmap(NULL, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (base == MAP_FAILED) {
+        close(fd);
+        unixctl_command_reply_error(conn, ovs_strerror(errno));
+        return;
+    }
+
+    const struct ct_dump_file_header *hdr = base;
+    if (hdr->magic != CT_DUMP_MAGIC) {
+        munmap(base, file_size);
+        close(fd);
+        unixctl_command_reply_error(conn, "bad magic");
+        return;
+    }
+    if (hdr->version != CT_DUMP_VERSION) {
+        munmap(base, file_size);
+        close(fd);
+        unixctl_command_reply_error(conn, "unsupported version");
+        return;
+    }
+    if (hdr->entry_size != sizeof(struct ct_dump_entry)) {
+        munmap(base, file_size);
+        close(fd);
+        unixctl_command_reply_error(conn, "entry size mismatch");
+        return;
+    }
+
+    size_t expected_size = sizeof(struct ct_dump_file_header)
+                         + hdr->n_entries * sizeof(struct ct_dump_entry);
+    if (file_size < expected_size) {
+        munmap(base, file_size);
+        close(fd);
+        unixctl_command_reply_error(conn, "file truncated");
+        return;
+    }
+
+    const struct ct_dump_entry *entries =
+        (const void *)((const char *)base
+                       + sizeof(struct ct_dump_file_header));
+
+    long long now = time_msec();
+    long long time_delta_ms = now - (long long) hdr->timestamp_ms;
+    uint64_t restored = 0, skipped = 0, errors = 0;
+
+    for (uint64_t i = 0; i < hdr->n_entries; i++) {
+        /* Adjust timeout for time elapsed since dump. */
+        struct ct_dump_entry adjusted = entries[i];
+        if (time_delta_ms > 0) {
+            uint32_t elapsed_sec = time_delta_ms / 1000;
+            if (adjusted.timeout <= elapsed_sec) {
+                skipped++;  /* Already expired. */
+                continue;
+            }
+            adjusted.timeout -= elapsed_sec;
+        }
+
+        int err = conntrack_restore(ct, &adjusted, now);
+        if (err == 0) {
+            restored++;
+        } else if (err == EEXIST) {
+            skipped++;
+        } else {
+            errors++;
+        }
+    }
+
+    uint64_t total_entries = hdr->n_entries;
+    munmap(base, file_size);
+    close(fd);
+
+    struct ds reply = DS_EMPTY_INITIALIZER;
+    ds_put_format(&reply,
+                  "[NDU] CT restore: %"PRIu64" restored, "
+                  "%"PRIu64" skipped, %"PRIu64" errors "
+                  "(from %"PRIu64" entries, delta %lld ms)\n",
+                  restored, skipped, errors,
+                  total_entries, time_delta_ms);
+    unixctl_command_reply(conn, ds_cstr(&reply));
+    ds_destroy(&reply);
+}
+
 /* dpif_netdev_init — 模块初始化函数。
  * 注册所有 ovs-appctl 控制命令，包括：
  * - pmd-stats-show/clear：PMD 统计查看/清零
@@ -2728,6 +2974,14 @@ dpif_netdev_init(void)
     unixctl_command_register("dpif-netdev/pkt-trace-set",
                              "enabled|disabled",
                              1, 1, dpif_netdev_pkt_trace_set, NULL);
+
+    /* @veencn: CT dump/restore for Phase 1 hot upgrade. */
+    unixctl_command_register("dpif-netdev/ct-dump-to-file",
+                             "path [-zone N] [dp]",
+                             1, 4, dpif_netdev_ct_dump_to_file, NULL);
+    unixctl_command_register("dpif-netdev/ct-restore-from-file",
+                             "path [dp]",
+                             1, 2, dpif_netdev_ct_restore_from_file, NULL);
 
     return 0;
 }

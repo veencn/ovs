@@ -49,18 +49,8 @@ COVERAGE_DEFINE(conntrack_tcp_seq_chk_bypass);
 COVERAGE_DEFINE(conntrack_tcp_seq_chk_failed);
 COVERAGE_DEFINE(conntrack_invalid_tcp_flags);
 
-struct tcp_peer {
-    uint32_t               seqlo;          /* Max sequence number sent     */
-    uint32_t               seqhi;          /* Max the other end ACKd + win */
-    uint16_t               max_win;        /* largest window (pre scaling) */
-    uint8_t                wscale;         /* window scaling factor        */
-    enum ct_dpif_tcp_state state;
-};
-
-struct conn_tcp {
-    struct conn up;
-    struct tcp_peer peer[2]; /* 'conn' lock protected. */
-};
+/* @veencn: struct tcp_peer and struct conn_tcp moved to conntrack-private.h
+ * for cross-file access during CT restore. */
 
 enum {
     TCPOPT_EOL,
@@ -518,3 +508,26 @@ struct ct_l4_proto ct_proto_tcp = {
     .conn_update = tcp_conn_update,
     .conn_get_protoinfo = tcp_conn_get_protoinfo,
 };
+
+/* @veencn: Export full TCP peer state for binary CT dump.
+ * Unlike tcp_conn_get_protoinfo(), this includes seqlo/seqhi/max_win
+ * which are required to correctly restore TCP connections. */
+void
+conn_tcp_get_full_state(const struct conn *conn_,
+                        struct ct_dump_entry *dump_entry)
+{
+    const struct conn_tcp *conn = conn_tcp_cast(conn_);
+
+    dump_entry->tcp.state_orig   = conn->peer[0].state;
+    dump_entry->tcp.state_reply  = conn->peer[1].state;
+    dump_entry->tcp.wscale_orig  = conn->peer[0].wscale;
+    dump_entry->tcp.wscale_reply = conn->peer[1].wscale;
+    dump_entry->tcp.seqlo_orig   = conn->peer[0].seqlo;
+    dump_entry->tcp.seqhi_orig   = conn->peer[0].seqhi;
+    dump_entry->tcp.max_win_orig = conn->peer[0].max_win;
+    dump_entry->tcp.seqlo_reply  = conn->peer[1].seqlo;
+    dump_entry->tcp.seqhi_reply  = conn->peer[1].seqhi;
+    dump_entry->tcp.max_win_reply = conn->peer[1].max_win;
+    dump_entry->tcp.flags_orig   = tcp_peer_to_protoinfo_flags(&conn->peer[0]);
+    dump_entry->tcp.flags_reply  = tcp_peer_to_protoinfo_flags(&conn->peer[1]);
+}

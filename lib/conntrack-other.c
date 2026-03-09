@@ -20,16 +20,8 @@
 #include "conntrack-tp.h"
 #include "dp-packet.h"
 
-enum OVS_PACKED_ENUM other_state {
-    OTHERS_FIRST,
-    OTHERS_MULTIPLE,
-    OTHERS_BIDIR,
-};
-
-struct conn_other {
-    struct conn up;
-    enum other_state state; /* 'conn' lock protected. */
-};
+/* @veencn: enum other_state and struct conn_other moved to conntrack-private.h
+ * for cross-file access during CT restore. */
 
 static const enum ct_timeout other_timeouts[] = {
     [OTHERS_FIRST] = CT_TM_OTHER_FIRST,

@@ -165,4 +165,10 @@ struct conntrack_zone_info zone_limit_get(struct conntrack *ct,
 int zone_limit_update(struct conntrack *ct, int32_t zone, uint32_t limit);
 int zone_limit_delete(struct conntrack *ct, int32_t zone);
 
+/* @veencn: Phase 1 hot upgrade — CT dump/restore. */
+struct ct_dump_entry;
+int conntrack_dump_next_full(struct conntrack_dump *, struct ct_dump_entry *);
+int conntrack_restore(struct conntrack *ct, const struct ct_dump_entry *entry,
+                      long long now);
+
 #endif /* conntrack.h */
