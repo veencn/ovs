@@ -38,6 +38,11 @@ bool dpif_is_netdev(const struct dpif *);
 #define NR_QUEUE   1
 #define NR_PMD_THREADS 1
 
+/* @veencn: upcall 细化阶段常量（供 ofproto 层使用，避免头文件循环依赖）。
+ * 值必须与 lib/dpif-netdev-private-thread.h 中 enum pkt_trace_stage 同步。 */
+#define PKT_TRACE_STAGE_UPCALL_XLATE 7
+void pkt_trace_mark_stage(int stage);
+
 #ifdef  __cplusplus
 }
 #endif

@@ -114,14 +114,6 @@ VLOG_DEFINE_THIS_MODULE(dpif_netdev);
  * 包括 miniflow 提取、EMC/SMC/dpcls 查找、upcall、action 执行等阶段。
  * 通过 ovs-appctl dpif-netdev/latency-* 命令控制。 */
 
-/* 将 CPU 时钟周期数转换为纳秒。 */
-static inline uint64_t
-latency_cycles_to_ns(uint64_t cycles)
-{
-    uint64_t hz = pmd_perf_get_tsc_hz();
-    return hz > 1 ? cycles * 1000000000ULL / hz : 0;
-}
-
 /* 更新某个阶段的延迟统计：累加计数/总周期数，更新最小/最大值，
  * 并将转换后的纳秒值放入直方图桶中（<100ns, 100-200ns, ... >=100us）。 */
 static inline void
@@ -136,7 +128,7 @@ latency_stage_update(struct latency_stage_stats *stage, uint64_t cycles)
         stage->max_cycles = cycles;
     }
 
-    uint64_t ns = latency_cycles_to_ns(cycles);
+    uint64_t ns = pmd_perf_cycles_to_ns(cycles);
     int bucket;
     if (ns < 100) {
         bucket = 0;
@@ -184,101 +176,8 @@ latency_stats_clear(struct pmd_latency_stats *s)
     latency_stats_init(s);
     s->enabled = was_enabled;
 }
-/* 核心单包测量：从 rx_tsc 到 t_now 的延迟。
- * 返回 true 表示记录成功（rx_tsc 有效），调用者可据此决定是否计数。 */
-static inline bool
-latency_mark_pkt(struct latency_stage_stats *stage,
-                 const struct dp_packet *pkt, uint64_t t_now)
-{
-    uint64_t rx = dp_packet_get_rx_tsc(pkt);
-    if (rx) {
-        latency_stage_update(stage, t_now - rx);
-        return true;
-    }
-    return false;
-}
-
-/* 批量计算端到端总延迟：遍历 batch，对每个包算 t_end - rx_tsc。 */
-static inline void
-latency_batch_total(struct pmd_latency_stats *ls,
-                    struct dp_packet_batch *batch, uint64_t t_end)
-{
-    struct dp_packet *pkt;
-    DP_PACKET_BATCH_FOR_EACH (i, pkt, batch) {
-        latency_mark_pkt(&ls->total, pkt, t_end);
-    }
-}
-
-/* @veencn_260223: Latency instrumentation macros.
- *
- * 统一入口: LATENCY(pmd, TYPE, ...)
- * TYPE: STAMP_BATCH, MARK, MARK_BATCH, BEGIN, END
- *
- * _LATENCY_END 内部变量 _lend 保存结束时间戳，
- * 可在可变参数中引用（如 latency_batch_total(..., _lend)）。 */
-
-#define LATENCY(PMD, TYPE, ...) _LATENCY_##TYPE(PMD, ##__VA_ARGS__)
-
-/* T1: 批量给包打 rx_tsc 时间戳 */
-#define _LATENCY_STAMP_BATCH(PMD, BATCH)                                \
-    do {                                                                \
-        if (OVS_UNLIKELY((PMD)->latency_stats.enabled)) {              \
-            struct dp_packet *_lpkt;                                    \
-            uint64_t _tsc = cycles_counter_update(&(PMD)->perf_stats); \
-            DP_PACKET_BATCH_FOR_EACH (_li, _lpkt, (BATCH)) {          \
-                dp_packet_set_rx_tsc(_lpkt, _tsc);                     \
-            }                                                           \
-        }                                                               \
-    } while (0)
-
-/* T2/T3a/T3b: 单包测量（可变参数仅在 rx_tsc 有效时执行） */
-#define _LATENCY_MARK(PMD, PKT, STAGE, ...)                             \
-    do {                                                                \
-        if (OVS_UNLIKELY((PMD)->latency_stats.enabled)) {              \
-            uint64_t _now = cycles_counter_update(&(PMD)->perf_stats); \
-            if (latency_mark_pkt(&(PMD)->latency_stats.STAGE,          \
-                                 (PKT), _now)) {                        \
-                __VA_ARGS__;                                            \
-            }                                                           \
-        }                                                               \
-    } while (0)
-
-/* T3c: 批量测量 + 条件过滤 + 命中计数 */
-#define _LATENCY_MARK_BATCH(PMD, BATCH, STAGE, COUNTER, FILTER)         \
-    do {                                                                \
-        if (OVS_UNLIKELY((PMD)->latency_stats.enabled)) {              \
-            struct dp_packet *_lpkt;                                    \
-            uint64_t _now = cycles_counter_update(&(PMD)->perf_stats); \
-            DP_PACKET_BATCH_FOR_EACH (_li, _lpkt, (BATCH)) {          \
-                if ((FILTER)[_li]                                       \
-                    && latency_mark_pkt(&(PMD)->latency_stats.STAGE,   \
-                                        _lpkt, _now)) {                 \
-                    (PMD)->latency_stats.COUNTER++;                     \
-                }                                                       \
-            }                                                           \
-        }                                                               \
-    } while (0)
-
-/* T3d前/T4前: 区间测量起点（声明变量，不能用 do-while 包装） */
-#define _LATENCY_BEGIN(PMD, VAR)                                        \
-    uint64_t VAR = 0;                                                   \
-    if (OVS_UNLIKELY((PMD)->latency_stats.enabled)) {                  \
-        VAR = cycles_counter_update(&(PMD)->perf_stats);               \
-    }
-
-/* T3d后/T4后: 区间测量终点（_lend 可在可变参数中引用） */
-#define _LATENCY_END(PMD, VAR, STAGE, ...)                              \
-    do {                                                                \
-        if (OVS_UNLIKELY((PMD)->latency_stats.enabled) && (VAR)) {    \
-            uint64_t _lend = cycles_counter_update(                     \
-                &(PMD)->perf_stats);                                    \
-            latency_stage_update(&(PMD)->latency_stats.STAGE,          \
-                                 _lend - (VAR));                        \
-            __VA_ARGS__;                                                \
-        }                                                               \
-    } while (0)
-
-/* @veencn_260223 end: latency helpers & macros */
+/* @veencn_260223 end: latency helpers (latency_mark_pkt/latency_batch_total
+ * and LATENCY macros removed — replaced by trace_finalize post-TX) */
 
 /* ====================================================================
  * @veencn: Per-packet trace — 单包处理路径追踪。
@@ -292,33 +191,25 @@ latency_batch_total(struct pmd_latency_stats *ls,
 
 /* 阶段名称（用于输出格式化） */
 static const char *trace_stage_names[TRACE_N_STAGES] = {
-    [TRACE_RX]            = "rx_port",
-    [TRACE_PHWOL]         = "phwol_lookup",
-    [TRACE_SIMPLE_MATCH]  = "simple_match",
-    [TRACE_MINIFLOW]      = "miniflow_extract",
-    [TRACE_EMC]           = "emc_lookup",
-    [TRACE_SMC]           = "smc_lookup",
-    [TRACE_DPCLS]         = "dpcls_lookup",
-    [TRACE_UPCALL]   = "upcall",
-    [TRACE_CONNTRACK]= "conntrack",
-    [TRACE_TNL_PUSH] = "tunnel_push",
-    [TRACE_TNL_POP]  = "tunnel_pop",
-    [TRACE_ACTION]   = "action_exec",
-    [TRACE_RECIRC]   = "recirculate",
-    [TRACE_TX]       = "tx_port",
+    [TRACE_RX]                = "rx_port",
+    [TRACE_PHWOL]             = "phwol_lookup",
+    [TRACE_SIMPLE_MATCH]      = "simple_match",
+    [TRACE_MINIFLOW]          = "miniflow_extract",
+    [TRACE_EMC]               = "emc_lookup",
+    [TRACE_SMC]               = "smc_lookup",
+    [TRACE_DPCLS]             = "dpcls_lookup",
+    [TRACE_UPCALL_XLATE]      = "xlate_actions(upcall)",
+    [TRACE_UPCALL_EXEC]       = "action_exec(upcall)",
+    [TRACE_UPCALL_FLOW_INST]  = "flow_install(upcall)",
+    [TRACE_UPCALL]            = "upcall_done",
+    [TRACE_CONNTRACK]         = "conntrack",
+    [TRACE_TNL_PUSH]          = "tunnel_push",
+    [TRACE_TNL_POP]           = "tunnel_pop",
+    [TRACE_OUTPUT_ACTION]     = "output_action",
+    [TRACE_ACTION]            = "action_exec",
+    [TRACE_RECIRC]            = "recirculate",
+    [TRACE_TX]                = "tx_port",
 };
-
-/* L4 协议名称（用于包头信息显示） */
-static const char *
-trace_proto_name(uint8_t proto)
-{
-    switch (proto) {
-    case IPPROTO_TCP:  return "TCP";
-    case IPPROTO_UDP:  return "UDP";
-    case IPPROTO_ICMP: return "ICMP";
-    default:           return "other";
-    }
-}
 
 /* 初始化 trace state（PMD 启动时调用） */
 static void
@@ -356,7 +247,8 @@ trace_rx_pkt(struct dp_netdev_pmd_thread *pmd,
     dp_packet_set_trace_idx(pkt, idx + 1);  /* 1-based */
 }
 
-/* 提取包头信息（miniflow_extract 之后调用，此时 L2/L3/L4 偏移已设置） */
+/* @veencn: 快照包头原始字节（一次 memcpy 替代逐字段提取）。
+ * 显示端通过 flow_extract() + flow_format() 完整解析。 */
 static inline void
 trace_fill_pkt_info(struct dp_netdev_pmd_thread *pmd,
                     const struct dp_packet *pkt)
@@ -367,44 +259,54 @@ trace_fill_pkt_info(struct dp_netdev_pmd_thread *pmd,
     }
     struct pkt_trace_entry *e = &pmd->trace.ring[tidx - 1];
 
-    /* L2: Ethernet header */
-    const struct eth_header *eth = dp_packet_eth(pkt);
-    if (eth) {
-        e->dl_src = eth->eth_src;
-        e->dl_dst = eth->eth_dst;
-        e->dl_type = eth->eth_type;
-    }
-
-    /* L3: IPv4 header */
-    if (pkt->l3_ofs != UINT16_MAX
-        && e->dl_type == htons(ETH_TYPE_IP)) {
-        const struct ip_header *ip = dp_packet_l3(pkt);
-        if (ip) {
-            e->nw_src = get_16aligned_be32(&ip->ip_src);
-            e->nw_dst = get_16aligned_be32(&ip->ip_dst);
-            e->nw_proto = ip->ip_proto;
-            e->nw_ttl = ip->ip_ttl;
-        }
-    }
-
-    /* L4: TCP/UDP source/dest ports */
-    if (pkt->l4_ofs != UINT16_MAX) {
-        const void *l4 = dp_packet_l4(pkt);
-        if (l4 && (e->nw_proto == IPPROTO_TCP
-                   || e->nw_proto == IPPROTO_UDP)) {
-            const struct udp_header *uh = l4;
-            e->tp_src = uh->udp_src;
-            e->tp_dst = uh->udp_dst;
-        }
-    }
+    const void *data = dp_packet_data(pkt);
+    uint32_t size = dp_packet_size(pkt);
+    e->hdr_snap_len = MIN(size, PKT_TRACE_HDR_SNAP_SIZE);
+    memcpy(e->hdr_snap, data, e->hdr_snap_len);
 }
 
-/* ---- TRACE 宏定义 ---- */
+/* ====================================================================
+ * @veencn: 简化探针系统 — 仅两种形式 PROBE_PKT + PROBE_BATCH
+ *
+ * 热路径只做一次 rdtsc + 赋值，LATENCY 统计延迟到 TX 后由
+ * trace_finalize() 统一从 ts[] 数组计算。
+ * ==================================================================== */
 
-#define TRACE(PMD, TYPE, ...) _TRACE_##TYPE(PMD, ##__VA_ARGS__)
+/* @veencn: 单包标记 */
+#define PROBE_PKT(PMD, PKT, STAGE)                                      \
+    do {                                                                 \
+        if (OVS_UNLIKELY((PMD)->trace.enabled)) {                       \
+            uint16_t _tidx = dp_packet_get_trace_idx(PKT);             \
+            if (_tidx && _tidx <= PKT_TRACE_RING_SIZE) {               \
+                (PMD)->trace.ring[_tidx - 1].ts[STAGE] =               \
+                    cycles_counter_update(&(PMD)->perf_stats);          \
+            }                                                            \
+        }                                                                \
+    } while (0)
 
-/* T1: RX 批量分配 trace slot + 打 RX 时间戳 */
-#define _TRACE_RX_BATCH(PMD, BATCH)                                      \
+/* @veencn: 批量标记（FILTER==NULL 标记全部，否则只标记 FILTER[i]!=0 的包）。
+ * FILTER 先存入 const void* 局部变量，用 uintptr_t* 做下标避免 void* 算术。 */
+#define PROBE_BATCH(PMD, BATCH, STAGE, FILTER)                           \
+    do {                                                                 \
+        if (OVS_UNLIKELY((PMD)->trace.enabled)) {                       \
+            const void *_filt = (FILTER);                                \
+            uint64_t _now = cycles_counter_update(&(PMD)->perf_stats);  \
+            struct dp_packet *_pkt;                                      \
+            DP_PACKET_BATCH_FOR_EACH (_i, _pkt, (BATCH)) {             \
+                if (!_filt                                               \
+                    || ((const uintptr_t *)_filt)[_i]) {                \
+                    uint16_t _tidx = dp_packet_get_trace_idx(_pkt);     \
+                    if (_tidx && _tidx <= PKT_TRACE_RING_SIZE) {       \
+                        (PMD)->trace.ring[_tidx - 1].ts[STAGE]         \
+                            = _now;                                      \
+                    }                                                    \
+                }                                                        \
+            }                                                            \
+        }                                                                \
+    } while (0)
+
+/* @veencn: RX 批量分配 trace slot + 打 RX 时间戳 */
+#define PROBE_RX_BATCH(PMD, BATCH)                                       \
     do {                                                                  \
         if (OVS_UNLIKELY((PMD)->trace.enabled)) {                        \
             struct dp_packet *_tpkt;                                      \
@@ -415,238 +317,129 @@ trace_fill_pkt_info(struct dp_netdev_pmd_thread *pmd,
         }                                                                 \
     } while (0)
 
-/* 单包记录阶段时间戳 */
-#define _TRACE_MARK(PMD, PKT, STAGE)                                     \
-    do {                                                                  \
-        if (OVS_UNLIKELY((PMD)->trace.enabled)) {                        \
-            uint16_t _tidx = dp_packet_get_trace_idx(PKT);              \
-            if (_tidx && _tidx <= PKT_TRACE_RING_SIZE) {                \
-                (PMD)->trace.ring[_tidx - 1].ts[STAGE] =                \
-                    cycles_counter_update(&(PMD)->perf_stats);           \
-            }                                                             \
-        }                                                                 \
-    } while (0)
+/* @veencn: 用保存的 tidx 标记（upcall 后包可能已被 steal） */
+static inline void
+trace_mark_saved(struct dp_netdev_pmd_thread *pmd,
+                 uint16_t tidx, enum pkt_trace_stage stage)
+{
+    if (OVS_UNLIKELY(pmd->trace.enabled
+                     && tidx && tidx <= PKT_TRACE_RING_SIZE)) {
+        pmd->trace.ring[tidx - 1].ts[stage] =
+            cycles_counter_update(&pmd->perf_stats);
+    }
+}
 
-/* 批量记录阶段时间戳 */
-#define _TRACE_MARK_BATCH(PMD, BATCH, STAGE)                             \
-    do {                                                                  \
-        if (OVS_UNLIKELY((PMD)->trace.enabled)) {                        \
-            struct dp_packet *_tpkt;                                      \
-            uint64_t _tnow = cycles_counter_update(&(PMD)->perf_stats); \
-            DP_PACKET_BATCH_FOR_EACH (_ti, _tpkt, (BATCH)) {            \
-                uint16_t _tidx = dp_packet_get_trace_idx(_tpkt);         \
-                if (_tidx && _tidx <= PKT_TRACE_RING_SIZE) {            \
-                    (PMD)->trace.ring[_tidx - 1].ts[STAGE] = _tnow;    \
-                }                                                         \
-            }                                                             \
-        }                                                                 \
-    } while (0)
+/* @veencn: TX 后统一结算 — 从 ts[] 计算各阶段延迟，更新 histogram */
+static inline void
+trace_finalize(struct dp_netdev_pmd_thread *pmd, uint16_t tidx)
+{
+    if (OVS_LIKELY(!pmd->latency_stats.enabled)) {
+        return;
+    }
+    struct pkt_trace_entry *e = &pmd->trace.ring[tidx - 1];
+    uint64_t rx = e->ts[TRACE_RX];
+    if (!rx) {
+        return;
+    }
 
-/* 带过滤的批量记录（dpcls: 只记录命中的包） */
-#define _TRACE_MARK_BATCH_FILTERED(PMD, BATCH, STAGE, FILTER)            \
-    do {                                                                  \
-        if (OVS_UNLIKELY((PMD)->trace.enabled)) {                        \
-            struct dp_packet *_tpkt;                                      \
-            uint64_t _tnow = cycles_counter_update(&(PMD)->perf_stats); \
-            DP_PACKET_BATCH_FOR_EACH (_ti, _tpkt, (BATCH)) {            \
-                if ((FILTER)[_ti]) {                                     \
-                    uint16_t _tidx = dp_packet_get_trace_idx(_tpkt);     \
-                    if (_tidx && _tidx <= PKT_TRACE_RING_SIZE) {        \
-                        (PMD)->trace.ring[_tidx - 1].ts[STAGE] = _tnow;\
-                    }                                                     \
-                }                                                         \
-            }                                                             \
-        }                                                                 \
-    } while (0)
+    /* miniflow */
+    if (e->ts[TRACE_MINIFLOW]) {
+        latency_stage_update(&pmd->latency_stats.miniflow,
+                             e->ts[TRACE_MINIFLOW] - rx);
+    }
 
-/* 提取包头信息 */
-#define _TRACE_FILL_INFO(PMD, PKT)                                       \
-    do {                                                                  \
-        if (OVS_UNLIKELY((PMD)->trace.enabled)) {                        \
-            trace_fill_pkt_info((PMD), (PKT));                           \
-        }                                                                 \
-    } while (0)
+    /* 查找阶段（互斥，按命中优先级） */
+    uint64_t after_lookup = 0;
+    struct {
+        enum pkt_trace_stage stage;
+        struct latency_stage_stats *stat;
+        uint64_t *cnt;
+    } lookups[] = {
+        { TRACE_PHWOL,        &pmd->latency_stats.phwol_lookup,
+                              &pmd->latency_stats.phwol_hit_count },
+        { TRACE_SIMPLE_MATCH, &pmd->latency_stats.simple_match,
+                              &pmd->latency_stats.simple_hit_count },
+        { TRACE_EMC,          &pmd->latency_stats.emc_lookup,
+                              &pmd->latency_stats.emc_hit_count },
+        { TRACE_SMC,          &pmd->latency_stats.smc_lookup,
+                              &pmd->latency_stats.smc_hit_count },
+        { TRACE_DPCLS,        &pmd->latency_stats.dpcls_lookup,
+                              &pmd->latency_stats.dpcls_hit_count },
+        { TRACE_UPCALL,       &pmd->latency_stats.upcall,
+                              &pmd->latency_stats.upcall_count },
+    };
+    for (size_t i = 0; i < ARRAY_SIZE(lookups); i++) {
+        if (e->ts[lookups[i].stage]) {
+            uint64_t base = (lookups[i].stage == TRACE_PHWOL
+                             || lookups[i].stage == TRACE_SIMPLE_MATCH)
+                            ? rx
+                            : (e->ts[TRACE_MINIFLOW]
+                               ? e->ts[TRACE_MINIFLOW] : rx);
+            latency_stage_update(lookups[i].stat,
+                                 e->ts[lookups[i].stage] - base);
+            (*lookups[i].cnt)++;
+            after_lookup = e->ts[lookups[i].stage];
+            break;
+        }
+    }
 
-/* 用保存的 trace_idx 记录（upcall 后包可能已被 steal） */
-#define _TRACE_MARK_SAVED(PMD, TIDX, STAGE)                              \
-    do {                                                                  \
-        if (OVS_UNLIKELY((PMD)->trace.enabled                            \
-                         && (TIDX) && (TIDX) <= PKT_TRACE_RING_SIZE)) { \
-            (PMD)->trace.ring[(TIDX) - 1].ts[STAGE] =                   \
-                cycles_counter_update(&(PMD)->perf_stats);               \
-        }                                                                 \
-    } while (0)
+    /* conntrack */
+    if (e->ts[TRACE_CONNTRACK]) {
+        uint64_t base = after_lookup ? after_lookup : rx;
+        latency_stage_update(&pmd->latency_stats.conntrack,
+                             e->ts[TRACE_CONNTRACK] - base);
+        pmd->latency_stats.conntrack_count++;
+    }
+    /* tnl_push */
+    if (e->ts[TRACE_TNL_PUSH]) {
+        uint64_t base = after_lookup ? after_lookup : rx;
+        latency_stage_update(&pmd->latency_stats.tnl_push,
+                             e->ts[TRACE_TNL_PUSH] - base);
+    }
+    /* tnl_pop */
+    if (e->ts[TRACE_TNL_POP]) {
+        uint64_t base = after_lookup ? after_lookup : rx;
+        latency_stage_update(&pmd->latency_stats.tnl_pop,
+                             e->ts[TRACE_TNL_POP] - base);
+    }
 
-/* TX: 批量记录 TX 时间戳 + 出端口号 */
-#define _TRACE_TX_BATCH(PMD, BATCH, PORT_NO)                             \
-    do {                                                                  \
-        if (OVS_UNLIKELY((PMD)->trace.enabled)) {                        \
-            struct dp_packet *_tpkt;                                      \
-            uint64_t _tnow = cycles_counter_update(&(PMD)->perf_stats); \
-            DP_PACKET_BATCH_FOR_EACH (_ti, _tpkt, (BATCH)) {            \
-                uint16_t _tidx = dp_packet_get_trace_idx(_tpkt);         \
-                if (_tidx && _tidx <= PKT_TRACE_RING_SIZE) {            \
-                    (PMD)->trace.ring[_tidx - 1].ts[TRACE_TX] = _tnow; \
-                    (PMD)->trace.ring[_tidx - 1].out_port = (PORT_NO);  \
-                }                                                         \
-            }                                                             \
-        }                                                                 \
-    } while (0)
+    /* action_exec */
+    if (after_lookup && e->ts[TRACE_ACTION]) {
+        latency_stage_update(&pmd->latency_stats.action_exec,
+                             e->ts[TRACE_ACTION] - after_lookup);
+    }
 
-/* @veencn end: per-packet trace helpers & macros */
+    /* total: rx → tx */
+    if (e->ts[TRACE_TX]) {
+        latency_stage_update(&pmd->latency_stats.total,
+                             e->ts[TRACE_TX] - rx);
+    }
+}
 
-/* ====================================================================
- * @veencn: 统一探针入口 PROBE 宏
- * ====================================================================
- * 第三层粘合宏，将 LATENCY（聚合统计）和 TRACE（单包追踪）合并为
- * 单一调用点。两个子系统可以独立开关，PROBE 宏只做串联。
- *
- * 架构:
- *   调用层:  PROBE(pmd, STAGE, ...)              ← 统一入口
- *                │ token paste
- *   粘合层:  _PROBE_RX_BATCH / _PROBE_EMC / ...  ← 10 个 PROBE 宏
- *                │ 分别调用
- *   子系统:  LATENCY(pmd, TYPE, ...)              ← 聚合统计
- *            TRACE(pmd, TYPE, ...)                ← 单包追踪
- * ==================================================================== */
+/* @veencn: TLS 供 ofproto 层的 upcall 回调写入 trace 时间戳 */
+static __thread struct pkt_trace_entry *tls_trace_entry;
 
-#define PROBE(PMD, STAGE, ...) _PROBE_##STAGE(PMD, ##__VA_ARGS__)
+/* @veencn: 跨层探针 — ofproto 层通过此函数标记 upcall 子阶段。
+ * 不依赖 pmd_perf_stats，直接读取 TSC。 */
+void
+pkt_trace_mark_stage(int stage)
+{
+    struct pkt_trace_entry *e = tls_trace_entry;
+    if (OVS_LIKELY(!e)) {
+        return;
+    }
+#ifdef DPDK_NETDEV
+    e->ts[stage] = rte_get_tsc_cycles();
+#elif !defined(_MSC_VER) && defined(__x86_64__)
+    uint32_t h, l;
+    asm volatile("rdtsc" : "=a" (l), "=d" (h));
+    e->ts[stage] = ((uint64_t) h << 32) | l;
+#else
+    e->ts[stage] = 0;
+#endif
+}
 
-/* T1: RX 入口 — 批量给包打时间戳 + 分配 trace slot */
-#define _PROBE_RX_BATCH(PMD, BATCH)                                     \
-    do {                                                                 \
-        LATENCY(PMD, STAMP_BATCH, BATCH);                               \
-        TRACE(PMD, RX_BATCH, BATCH);                                    \
-    } while (0)
-
-/* T1a: PHWOL 命中 — 硬件卸载快路径（无 miniflow_extract） */
-#define _PROBE_PHWOL(PMD, PKT)                                          \
-    do {                                                                 \
-        LATENCY(PMD, MARK, PKT, phwol_lookup,                           \
-                (PMD)->latency_stats.phwol_hit_count++);                 \
-        TRACE(PMD, MARK, PKT, TRACE_PHWOL);                             \
-        TRACE(PMD, FILL_INFO, PKT);                                     \
-    } while (0)
-
-/* T1b: Simple Match 命中 — 简单匹配快路径（无 miniflow_extract） */
-#define _PROBE_SIMPLE_MATCH(PMD, PKT)                                   \
-    do {                                                                 \
-        LATENCY(PMD, MARK, PKT, simple_match,                           \
-                (PMD)->latency_stats.simple_hit_count++);                \
-        TRACE(PMD, MARK, PKT, TRACE_SIMPLE_MATCH);                      \
-        TRACE(PMD, FILL_INFO, PKT);                                     \
-    } while (0)
-
-/* T2: miniflow 完成 — 记录提取延迟 + 填充包头信息 */
-#define _PROBE_MINIFLOW(PMD, PKT)                                       \
-    do {                                                                 \
-        LATENCY(PMD, MARK, PKT, miniflow);                              \
-        TRACE(PMD, MARK, PKT, TRACE_MINIFLOW);                          \
-        TRACE(PMD, FILL_INFO, PKT);                                     \
-    } while (0)
-
-/* T3a: EMC 命中 */
-#define _PROBE_EMC(PMD, PKT)                                            \
-    do {                                                                 \
-        LATENCY(PMD, MARK, PKT, emc_lookup,                             \
-                (PMD)->latency_stats.emc_hit_count++);                   \
-        TRACE(PMD, MARK, PKT, TRACE_EMC);                               \
-    } while (0)
-
-/* T3b: SMC 命中 */
-#define _PROBE_SMC(PMD, PKT)                                            \
-    do {                                                                 \
-        LATENCY(PMD, MARK, PKT, smc_lookup,                             \
-                (PMD)->latency_stats.smc_hit_count++);                   \
-        TRACE(PMD, MARK, PKT, TRACE_SMC);                               \
-    } while (0)
-
-/* T3c: dpcls 批量命中 */
-#define _PROBE_DPCLS(PMD, BATCH, FILTER)                                \
-    do {                                                                 \
-        LATENCY(PMD, MARK_BATCH, BATCH, dpcls_lookup,                   \
-                dpcls_hit_count, FILTER);                                \
-        TRACE(PMD, MARK_BATCH_FILTERED, BATCH, TRACE_DPCLS, FILTER);    \
-    } while (0)
-
-/* T3d: upcall 区间开始 — 声明计时变量 + 保存 trace_idx
- * 注意：不能用 do-while 包装（变量需在后续可见） */
-#define _PROBE_BEGIN_UPCALL(PMD, PKT)                                   \
-    LATENCY(PMD, BEGIN, t_upcall_start);                                \
-    uint16_t _upcall_tidx = dp_packet_get_trace_idx(PKT)
-
-/* T3d: upcall 区间结束 */
-#define _PROBE_END_UPCALL(PMD)                                          \
-    LATENCY(PMD, END, t_upcall_start, upcall,                          \
-            (PMD)->latency_stats.upcall_count++);                       \
-    TRACE(PMD, MARK_SAVED, _upcall_tidx, TRACE_UPCALL)
-
-/* T4: action 区间开始
- * 注意：不能用 do-while 包装（变量需在后续可见） */
-#define _PROBE_BEGIN_ACTION(PMD)                                        \
-    LATENCY(PMD, BEGIN, t_action_start)
-
-/* T4: action 区间结束（含端到端 total 计算）
- * _lend 是 LATENCY END 内部声明的变量，可在可变参数中引用 */
-#define _PROBE_END_ACTION(PMD, BATCH)                                   \
-    LATENCY(PMD, END, t_action_start, action_exec,                     \
-            latency_batch_total(&(PMD)->latency_stats, BATCH, _lend)); \
-    TRACE(PMD, MARK_BATCH, BATCH, TRACE_ACTION)
-
-/* T5: TX 出口 — 记录时间戳 + 出端口号（仅 trace，latency 不覆盖 TX） */
-#define _PROBE_TX(PMD, BATCH, PORT_NO)                                  \
-    TRACE(PMD, TX_BATCH, BATCH, PORT_NO)
-
-/* T6: Conntrack 区间开始 */
-#define _PROBE_BEGIN_CT(PMD)                                            \
-    LATENCY(PMD, BEGIN, t_ct_start)
-
-/* T6: Conntrack 区间结束 */
-#define _PROBE_END_CT(PMD, BATCH)                                       \
-    LATENCY(PMD, END, t_ct_start, conntrack,                            \
-            (PMD)->latency_stats.conntrack_count++);                    \
-    TRACE(PMD, MARK_BATCH, BATCH, TRACE_CONNTRACK)
-
-/* T7: Tunnel push 区间开始 */
-#define _PROBE_BEGIN_TNL_PUSH(PMD)                                      \
-    LATENCY(PMD, BEGIN, t_tnl_push_start)
-
-/* T7: Tunnel push 区间结束 */
-#define _PROBE_END_TNL_PUSH(PMD, BATCH)                                 \
-    LATENCY(PMD, END, t_tnl_push_start, tnl_push);                     \
-    TRACE(PMD, MARK_BATCH, BATCH, TRACE_TNL_PUSH)
-
-/* T8: Tunnel pop 区间开始 */
-#define _PROBE_BEGIN_TNL_POP(PMD)                                       \
-    LATENCY(PMD, BEGIN, t_tnl_pop_start)
-
-/* T8: Tunnel pop 区间结束 */
-#define _PROBE_END_TNL_POP(PMD, BATCH)                                  \
-    LATENCY(PMD, END, t_tnl_pop_start, tnl_pop);                       \
-    TRACE(PMD, MARK_BATCH, BATCH, TRACE_TNL_POP)
-
-/* T9: Recirculation — 标记 batch + 记录 recirc_id */
-#define _PROBE_RECIRC(PMD, BATCH)                                       \
-    do {                                                                 \
-        if (OVS_UNLIKELY((PMD)->latency_stats.enabled)) {              \
-            (PMD)->latency_stats.recirc_count++;                        \
-        }                                                                \
-        if (OVS_UNLIKELY((PMD)->trace.enabled)) {                      \
-            uint64_t _rnow = cycles_counter_update(&(PMD)->perf_stats);\
-            struct dp_packet *_rpkt;                                     \
-            DP_PACKET_BATCH_FOR_EACH (_ri, _rpkt, (BATCH)) {           \
-                uint16_t _tidx = dp_packet_get_trace_idx(_rpkt);        \
-                if (_tidx && _tidx <= PKT_TRACE_RING_SIZE) {           \
-                    (PMD)->trace.ring[_tidx - 1].ts[TRACE_RECIRC]      \
-                        = _rnow;                                         \
-                    (PMD)->trace.ring[_tidx - 1].recirc_id             \
-                        = _rpkt->md.recirc_id;                           \
-                }                                                        \
-            }                                                            \
-        }                                                                \
-    } while (0)
-
-/* @veencn end: unified PROBE macros */
+/* @veencn end: simplified probe system */
 
 /* Auto Load Balancing Defaults */
 /* 自动负载均衡（ALB）默认参数：
@@ -2249,9 +2042,9 @@ latency_stage_format(struct ds *reply, const char *name,
         ds_put_format(reply, "  %-20s  (no data)\n", name);
         return;
     }
-    uint64_t avg_ns = latency_cycles_to_ns(stage->total_cycles / stage->count);
-    uint64_t min_ns = latency_cycles_to_ns(stage->min_cycles);
-    uint64_t max_ns = latency_cycles_to_ns(stage->max_cycles);
+    uint64_t avg_ns = pmd_perf_cycles_to_ns(stage->total_cycles / stage->count);
+    uint64_t min_ns = pmd_perf_cycles_to_ns(stage->min_cycles);
+    uint64_t max_ns = pmd_perf_cycles_to_ns(stage->max_cycles);
 
     ds_put_format(reply,
                   "  %-20s  cnt: %10"PRIu64
@@ -2518,6 +2311,12 @@ dpif_netdev_latency_set(struct unixctl_conn *conn,
             if (enable && !pmd->latency_stats.enabled) {
                 latency_stats_clear(&pmd->latency_stats);
             }
+            /* @veencn: latency 依赖 trace 的 ts[] 数据，
+             * 开启 latency 时自动开启 trace */
+            if (enable && !pmd->trace.enabled) {
+                pkt_trace_state_init(&pmd->trace);
+                pmd->trace.enabled = true;
+            }
             pmd->latency_stats.enabled = enable;
         }
     }
@@ -2559,30 +2358,21 @@ trace_entry_format(struct ds *reply, const struct pkt_trace_entry *e,
     /* 标题行：序号 */
     ds_put_format(reply, "=== Packet #%d/%d ===\n", seq, total);
 
-    /* L2/L3 包头信息 */
-    ds_put_format(reply,
-        "  " ETH_ADDR_FMT " -> " ETH_ADDR_FMT "\n",
-        ETH_ADDR_ARGS(e->dl_src), ETH_ADDR_ARGS(e->dl_dst));
-
-    if (e->dl_type == htons(ETH_TYPE_IP)) {
-        ds_put_format(reply,
-            "  " IP_FMT " -> " IP_FMT ", %s, ttl=%u",
-            IP_ARGS(e->nw_src), IP_ARGS(e->nw_dst),
-            trace_proto_name(e->nw_proto), e->nw_ttl);
-        if (e->nw_proto == IPPROTO_TCP || e->nw_proto == IPPROTO_UDP) {
-            ds_put_format(reply, ", %s:%u -> %s:%u",
-                trace_proto_name(e->nw_proto),
-                ntohs(e->tp_src),
-                trace_proto_name(e->nw_proto),
-                ntohs(e->tp_dst));
-        }
-        /* in_port name */
+    /* @veencn: 从快照重建 dp_packet，用 flow_extract + flow_format 输出
+     * 完整包头信息（支持 IPv4/IPv6/ARP/ICMP/TCP flags/VLAN 等）。 */
+    if (e->hdr_snap_len > 0) {
+        struct dp_packet buf;
+        struct flow flow;
+        dp_packet_use_const(&buf, e->hdr_snap, e->hdr_snap_len);
+        buf.packet_type = htonl(PT_ETH);
+        flow_extract(&buf, &flow);
+        ds_put_cstr(reply, "  ");
+        flow_format(reply, &flow, NULL);
         ds_put_format(reply, ", in_port=%s",
                       trace_port_name(dp, e->in_port));
         ds_put_char(reply, '\n');
     } else {
-        ds_put_format(reply, "  EtherType=0x%04x, in_port=%s\n",
-                      ntohs(e->dl_type),
+        ds_put_format(reply, "  (no header snapshot), in_port=%s\n",
                       trace_port_name(dp, e->in_port));
     }
     if (e->recirc_id) {
@@ -2628,7 +2418,7 @@ trace_entry_format(struct ds *reply, const struct pkt_trace_entry *e,
         int s = sorted[i].stage;
         uint64_t delta_cycles = sorted[i].tsc >= rx_tsc
                                 ? sorted[i].tsc - rx_tsc : 0;
-        uint64_t ns = latency_cycles_to_ns(delta_cycles);
+        uint64_t ns = pmd_perf_cycles_to_ns(delta_cycles);
 
         /* Bar 宽度：剩余时间占比，最大 32 字符 */
         uint64_t remaining = total_cycles > delta_cycles
@@ -2676,15 +2466,21 @@ trace_entry_format(struct ds *reply, const struct pkt_trace_entry *e,
     }
 
     /* 总结行 */
-    uint64_t total_ns = latency_cycles_to_ns(total_cycles);
+    uint64_t total_ns = pmd_perf_cycles_to_ns(total_cycles);
     ds_put_cstr(reply,
         "  ---------------------------------------------------------\n");
     ds_put_format(reply, "  Total: %"PRIu64" ns   Path: ", total_ns);
 
-    /* 构建 path 字符串（按时间戳顺序） */
+    /* 构建 path 字符串（按时间戳顺序）
+     * @veencn: 跳过 upcall 子阶段（XLATE/EXEC/FLOW_INST），
+     *          只显示 upcall_done，避免 path 行过长 */
     bool first = true;
     for (int i = 0; i < n_stages; i++) {
         int s = sorted[i].stage;
+        if (s == TRACE_UPCALL_XLATE || s == TRACE_UPCALL_EXEC
+            || s == TRACE_UPCALL_FLOW_INST) {
+            continue;
+        }
         if (!first) {
             ds_put_cstr(reply, " -> ");
         }
@@ -6459,7 +6255,19 @@ dp_netdev_pmd_flush_output_on_port(struct dp_netdev_pmd_thread *pmd,
     output_cnt = dp_packet_batch_size(&p->output_pkts);
     ovs_assert(output_cnt > 0);
 
-    PROBE(pmd, TX, &p->output_pkts, p->port->port_no);
+    /* @veencn: TX 标记 + trace_finalize 统一结算 LATENCY */
+    if (OVS_UNLIKELY(pmd->trace.enabled)) {
+        uint64_t _now = cycles_counter_update(&pmd->perf_stats);
+        struct dp_packet *_pkt;
+        DP_PACKET_BATCH_FOR_EACH (_i, _pkt, &p->output_pkts) {
+            uint16_t _tidx = dp_packet_get_trace_idx(_pkt);
+            if (_tidx && _tidx <= PKT_TRACE_RING_SIZE) {
+                pmd->trace.ring[_tidx - 1].ts[TRACE_TX] = _now;
+                pmd->trace.ring[_tidx - 1].out_port = p->port->port_no;
+                trace_finalize(pmd, _tidx);
+            }
+        }
+    }
 
     if (p->port->txq_mode == TXQ_MODE_XPS_HASH) {
         int n_txq = netdev_n_txq(p->port->netdev);
@@ -6607,7 +6415,7 @@ dp_netdev_process_rxq_port(struct dp_netdev_pmd_thread *pmd,
         }
 
         /* @veencn_260223: 为每个包打上收包时刻的 TSC 时间戳 */
-        PROBE(pmd, RX_BATCH, &batch);
+        PROBE_RX_BATCH(pmd, &batch);
 
         /* === 核心处理调用 ===
          * 先尝试 MFEX 优化路径（netdev_input_func，如 AVX512 miniflow 提取），
@@ -9424,8 +9232,7 @@ packet_batch_per_flow_execute(struct packet_batch_per_flow *batch,
      * 这里用 ovsrcu_get 保证读到一致的版本。 */
     actions = dp_netdev_flow_get_actions(flow);
 
-    /* @veencn_260223: 记录 action 执行延迟和端到端总延迟 */
-    PROBE(pmd, BEGIN_ACTION);
+    /* @veencn_260223: action 执行（latency 由 trace_finalize 统一结算） */
 
     /* 步骤 3：执行 actions。
      * 内部调用 odp_execute_actions()，遍历 action 列表，
@@ -9439,7 +9246,7 @@ packet_batch_per_flow_execute(struct packet_batch_per_flow *batch,
     dp_netdev_execute_actions(pmd, &batch->array, true, &flow->flow,
                               actions->actions, actions->size);
 
-    PROBE(pmd, END_ACTION, &batch->array);
+    PROBE_BATCH(pmd, &batch->array, TRACE_ACTION, NULL);
 }
 
 /* 直接执行批量报文的 actions（SIMD 优化路径使用）。 */
@@ -9536,8 +9343,8 @@ smc_lookup_batch(struct dp_netdev_pmd_thread *pmd,
                 flow->flow.in_port.odp_port == packet->md.in_port.odp_port)) {
                     tcp_flags = miniflow_get_tcp_flags(&keys[i].mf);
 
-                    /* @veencn_260223: SMC hit - record lookup latency. */
-                    PROBE(pmd, SMC, packet);
+                    /* @veencn_260223: SMC hit */
+                    PROBE_PKT(pmd, packet, TRACE_SMC);
 
                     /* SMC hit and emc miss, we insert into EMC */
                     keys[i].len =
@@ -9795,7 +9602,8 @@ dfc_processing(struct dp_netdev_pmd_thread *pmd,
             if (OVS_LIKELY(flow)) {
                 /* 硬件命中：解析 TCP 标志后直接入队 */
                 tcp_flags = parse_tcp_flags(packet, NULL, NULL, NULL);
-                PROBE(pmd, PHWOL, packet);
+                PROBE_PKT(pmd, packet, TRACE_PHWOL);
+                trace_fill_pkt_info(pmd, packet);
                 n_phwol_hit++;
                 dfc_processing_enqueue_classified_packet(
                         packet, flow, tcp_flags, batch_enable,
@@ -9816,7 +9624,8 @@ dfc_processing(struct dp_netdev_pmd_thread *pmd,
             flow = dp_netdev_simple_match_lookup(pmd, port_no, dl_type,
                                                  nw_frag, vlan_tci);
             if (OVS_LIKELY(flow)) {
-                PROBE(pmd, SIMPLE_MATCH, packet);
+                PROBE_PKT(pmd, packet, TRACE_SIMPLE_MATCH);
+                trace_fill_pkt_info(pmd, packet);
                 n_simple_hit++;
                 dfc_processing_enqueue_classified_packet(
                         packet, flow, tcp_flags, batch_enable,
@@ -9839,8 +9648,9 @@ dfc_processing(struct dp_netdev_pmd_thread *pmd,
                 ? dpif_netdev_packet_get_rss_hash_orig_pkt(packet, &key->mf)
                 : dpif_netdev_packet_get_rss_hash(packet, &key->mf);
 
-        /* @veencn_260223: 记录 miniflow 提取延迟 */
-        PROBE(pmd, MINIFLOW, packet);
+        /* @veencn_260223: 记录 miniflow 提取 */
+        PROBE_PKT(pmd, packet, TRACE_MINIFLOW);
+        trace_fill_pkt_info(pmd, packet);
 
         /* --- 查找路径 3：EMC（Exact Match Cache）---
          * cur_min > 0 时才查找（cur_min==0 表示 EMC 被禁用）。
@@ -9848,8 +9658,8 @@ dfc_processing(struct dp_netdev_pmd_thread *pmd,
         flow = (cur_min != 0) ? emc_lookup(&cache->emc_cache, key) : NULL;
         if (OVS_LIKELY(flow)) {
             /* EMC 命中 — 最快的软件路径 */
-            /* @veencn_260223: 记录 EMC 命中延迟 */
-            PROBE(pmd, EMC, packet);
+            /* @veencn_260223: EMC 命中 */
+            PROBE_PKT(pmd, packet, TRACE_EMC);
             tcp_flags = miniflow_get_tcp_flags(&key->mf);
             n_emc_hit++;
             dfc_processing_enqueue_classified_packet(
@@ -9928,6 +9738,13 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
     uint64_t cycles = cycles_counter_update(&pmd->perf_stats);
     odp_port_t orig_in_port = packet->md.orig_in_port;
 
+    /* @veencn: 设置 TLS，供 ofproto 层 upcall_cb 写入 TRACE_UPCALL_XLATE */
+    uint16_t tidx = dp_packet_get_trace_idx(packet);
+    if (OVS_UNLIKELY(pmd->trace.enabled
+                     && tidx && tidx <= PKT_TRACE_RING_SIZE)) {
+        tls_trace_entry = &pmd->trace.ring[tidx - 1];
+    }
+
     match.tun_md.valid = false;
     miniflow_expand(&key->mf, &match.flow);
     memset(&match.wc, 0, sizeof match.wc);
@@ -9940,6 +9757,7 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
                              &ufid, DPIF_UC_MISS, NULL, actions,
                              put_actions);
     if (OVS_UNLIKELY(error && error != ENOSPC)) {
+        tls_trace_entry = NULL;  /* @veencn: 清除 TLS */
         dp_packet_delete(packet);
         COVERAGE_INC(datapath_drop_upcall_error);
         return error;
@@ -9961,6 +9779,7 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
     dp_packet_batch_init_packet(&b, packet);
     dp_netdev_execute_actions(pmd, &b, true, &match.flow,
                               actions->data, actions->size);
+    trace_mark_saved(pmd, tidx, TRACE_UPCALL_EXEC);  /* @veencn */
 
     add_actions = put_actions->size ? put_actions : actions;
     if (OVS_LIKELY(error != ENOSPC)) {
@@ -9982,7 +9801,12 @@ handle_packet_upcall(struct dp_netdev_pmd_thread *pmd,
         uint32_t hash = dp_netdev_flow_hash(&netdev_flow->ufid);
         smc_insert(pmd, key, hash);
         emc_probabilistic_insert(pmd, key, netdev_flow);
+        trace_mark_saved(pmd, tidx, TRACE_UPCALL_FLOW_INST);  /* @veencn */
     }
+
+    trace_mark_saved(pmd, tidx, TRACE_UPCALL);  /* @veencn: upcall 整体完成 */
+    tls_trace_entry = NULL;  /* @veencn: 清除 TLS */
+
     if (pmd_perf_metrics_enabled(pmd)) {
         /* Update upcall stats. */
         cycles = cycles_counter_update(&pmd->perf_stats) - cycles;
@@ -10061,8 +9885,8 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
         memset(rules, 0, sizeof(rules));
     }
 
-    /* @veencn_260223: 记录 dpcls 命中包的查找延迟 */
-    PROBE(pmd, DPCLS, packets_, rules);
+    /* @veencn_260223: 记录 dpcls 命中包 */
+    PROBE_BATCH(pmd, packets_, TRACE_DPCLS, rules);
 
     /* === 阶段 2：upcall 处理（慢路径）===
      * 仅在有 miss 且能获取 upcall 读锁时进入。
@@ -10096,19 +9920,9 @@ fast_path_processing(struct dp_netdev_pmd_thread *pmd,
                 continue;
             }
 
-            /* @veencn_260223: 记录 upcall 延迟 */
-            PROBE(pmd, BEGIN_UPCALL, packet);
-
-            /* 核心 upcall 调用：
-             * 1. 将包发送到 ofproto（OpenFlow 查表）
-             * 2. 用返回的 action 执行数据包
-             * 3. 将新的 megaflow 规则安装到 dpcls + EMC + SMC
-             * 注意：upcall 会直接执行该包的 action，
-             *       所以 upcall 的包不会再进入下面的 flow_map 流程 */
+            /* @veencn: upcall（子阶段探针在 handle_packet_upcall 内部标记） */
             int error = handle_packet_upcall(pmd, packet, keys[i],
                                              &actions, &put_actions);
-
-            PROBE(pmd, END_UPCALL);
 
             if (OVS_UNLIKELY(error)) {
                 upcall_fail_cnt++;
@@ -10278,7 +10092,21 @@ static void
 dp_netdev_recirculate(struct dp_netdev_pmd_thread *pmd,
                       struct dp_packet_batch *packets)
 {
-    PROBE(pmd, RECIRC, packets);
+    /* @veencn: 标记 recirc + 记录 recirc_id */
+    PROBE_BATCH(pmd, packets, TRACE_RECIRC, NULL);
+    if (OVS_UNLIKELY(pmd->trace.enabled)) {
+        struct dp_packet *_rpkt;
+        DP_PACKET_BATCH_FOR_EACH (_ri, _rpkt, packets) {
+            uint16_t _tidx = dp_packet_get_trace_idx(_rpkt);
+            if (_tidx && _tidx <= PKT_TRACE_RING_SIZE) {
+                pmd->trace.ring[_tidx - 1].recirc_id
+                    = _rpkt->md.recirc_id;
+            }
+        }
+    }
+    if (OVS_UNLIKELY(pmd->latency_stats.enabled)) {
+        pmd->latency_stats.recirc_count++;
+    }
     dp_netdev_input__(pmd, packets, true, 0);
 }
 
@@ -10579,6 +10407,7 @@ dp_execute_cb(void *aux_, struct dp_packet_batch *packets_,
     case OVS_ACTION_ATTR_OUTPUT:
         dp_execute_output_action(pmd, packets_, should_steal,
                                  nl_attr_get_odp_port(a));
+        PROBE_BATCH(pmd, packets_, TRACE_OUTPUT_ACTION, NULL);  /* @veencn */
         return;
 
     case OVS_ACTION_ATTR_LB_OUTPUT:
@@ -10596,12 +10425,11 @@ dp_execute_cb(void *aux_, struct dp_packet_batch *packets_,
         }
         dp_packet_batch_apply_cutlen(packets_);
         packet_count = dp_packet_batch_size(packets_);
-        PROBE(pmd, BEGIN_TNL_PUSH);
         if (push_tnl_action(pmd, a, packets_)) {
             COVERAGE_ADD(datapath_drop_tunnel_push_error,
                          packet_count);
         }
-        PROBE(pmd, END_TNL_PUSH, packets_);
+        PROBE_BATCH(pmd, packets_, TRACE_TNL_PUSH, NULL);
         return;
 
     case OVS_ACTION_ATTR_TUNNEL_POP:
@@ -10622,9 +10450,8 @@ dp_execute_cb(void *aux_, struct dp_packet_batch *packets_,
                 dp_packet_batch_apply_cutlen(packets_);
 
                 packet_count = dp_packet_batch_size(packets_);
-                PROBE(pmd, BEGIN_TNL_POP);
                 netdev_pop_header(p->port->netdev, packets_);
-                PROBE(pmd, END_TNL_POP, packets_);
+                PROBE_BATCH(pmd, packets_, TRACE_TNL_POP, NULL);
                 packets_dropped =
                    packet_count - dp_packet_batch_size(packets_);
                 if (packets_dropped) {
@@ -10857,11 +10684,10 @@ dp_execute_cb(void *aux_, struct dp_packet_batch *packets_,
             VLOG_WARN_RL(&rl, "NAT specified without commit.");
         }
 
-        PROBE(pmd, BEGIN_CT);
         conntrack_execute(dp->conntrack, packets_, aux->flow->dl_type, force,
                           commit, zone, setmark, setlabel, helper,
                           nat_action_info_ref, pmd->ctx.now / 1000, tp_id);
-        PROBE(pmd, END_CT, packets_);
+        PROBE_BATCH(pmd, packets_, TRACE_CONNTRACK, NULL);
         break;
     }
 
