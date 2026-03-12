@@ -368,13 +368,21 @@ trace_finalize(struct dp_netdev_pmd_thread *pmd, uint16_t tidx)
         { TRACE_UPCALL,       &pmd->latency_stats.upcall,
                               &pmd->latency_stats.upcall_count },
     };
+    /* @veencn: After recirc, MINIFLOW is overwritten by the second pass
+     * but first-pass-only stages (DPCLS, UPCALL) retain stale timestamps.
+     * Guard against base > ts to prevent uint64_t underflow. */
     for (size_t i = 0; i < ARRAY_SIZE(lookups); i++) {
         if (e->ts[lookups[i].stage]) {
-            uint64_t base = (lookups[i].stage == TRACE_PHWOL
-                             || lookups[i].stage == TRACE_SIMPLE_MATCH)
-                            ? rx
-                            : (e->ts[TRACE_MINIFLOW]
-                               ? e->ts[TRACE_MINIFLOW] : rx);
+            uint64_t base;
+            if (lookups[i].stage == TRACE_PHWOL
+                || lookups[i].stage == TRACE_SIMPLE_MATCH) {
+                base = rx;
+            } else if (e->ts[TRACE_MINIFLOW]
+                       && e->ts[TRACE_MINIFLOW] < e->ts[lookups[i].stage]) {
+                base = e->ts[TRACE_MINIFLOW];
+            } else {
+                base = rx;
+            }
             latency_stage_update(lookups[i].stat,
                                  e->ts[lookups[i].stage] - base);
             (*lookups[i].cnt)++;
@@ -383,28 +391,39 @@ trace_finalize(struct dp_netdev_pmd_thread *pmd, uint16_t tidx)
         }
     }
 
+    /* @veencn: For conntrack/tnl stages, the timestamp is recorded during
+     * first-pass action execution.  After recirc, the lookup timestamps
+     * (MINIFLOW/EMC/DPCLS) get overwritten by the second pass, so
+     * after_lookup may be *later* than the conntrack/tnl timestamp.
+     * Detect this inversion and fall back to rx as base to avoid
+     * uint64_t underflow producing bogus ~4.8s values. */
+
     /* conntrack */
     if (e->ts[TRACE_CONNTRACK]) {
-        uint64_t base = after_lookup ? after_lookup : rx;
+        uint64_t base = (after_lookup && after_lookup < e->ts[TRACE_CONNTRACK])
+                        ? after_lookup : rx;
         latency_stage_update(&pmd->latency_stats.conntrack,
                              e->ts[TRACE_CONNTRACK] - base);
         pmd->latency_stats.conntrack_count++;
     }
     /* tnl_push */
     if (e->ts[TRACE_TNL_PUSH]) {
-        uint64_t base = after_lookup ? after_lookup : rx;
+        uint64_t base = (after_lookup && after_lookup < e->ts[TRACE_TNL_PUSH])
+                        ? after_lookup : rx;
         latency_stage_update(&pmd->latency_stats.tnl_push,
                              e->ts[TRACE_TNL_PUSH] - base);
     }
     /* tnl_pop */
     if (e->ts[TRACE_TNL_POP]) {
-        uint64_t base = after_lookup ? after_lookup : rx;
+        uint64_t base = (after_lookup && after_lookup < e->ts[TRACE_TNL_POP])
+                        ? after_lookup : rx;
         latency_stage_update(&pmd->latency_stats.tnl_pop,
                              e->ts[TRACE_TNL_POP] - base);
     }
 
-    /* action_exec */
-    if (after_lookup && e->ts[TRACE_ACTION]) {
+    /* action_exec: same recirc-aware guard. */
+    if (after_lookup && e->ts[TRACE_ACTION]
+        && after_lookup < e->ts[TRACE_ACTION]) {
         latency_stage_update(&pmd->latency_stats.action_exec,
                              e->ts[TRACE_ACTION] - after_lookup);
     }
@@ -2279,6 +2298,9 @@ dpif_netdev_latency_clear(struct unixctl_conn *conn,
         struct dp_netdev_pmd_thread *pmd;
         CMAP_FOR_EACH (pmd, node, &dp->poll_threads) {
             latency_stats_clear(&pmd->latency_stats);
+            /* @veencn: Also clear trace ring to prevent stale in-flight
+             * timestamps from being finalized into freshly-cleared stats. */
+            pkt_trace_state_clear(&pmd->trace);
         }
     }
     ovs_mutex_unlock(&dp_netdev_mutex);
@@ -2308,13 +2330,13 @@ dpif_netdev_latency_set(struct unixctl_conn *conn,
         struct dp_netdev *dp = node->data;
         struct dp_netdev_pmd_thread *pmd;
         CMAP_FOR_EACH (pmd, node, &dp->poll_threads) {
-            if (enable && !pmd->latency_stats.enabled) {
+            if (enable) {
+                /* @veencn: Always clear stats AND trace ring on enable,
+                 * even if already enabled. Without clearing the trace ring,
+                 * in-flight packets' stale timestamps in ring slots would
+                 * be finalized into the freshly-zeroed stats on TX. */
                 latency_stats_clear(&pmd->latency_stats);
-            }
-            /* @veencn: latency 依赖 trace 的 ts[] 数据，
-             * 开启 latency 时自动开启 trace */
-            if (enable && !pmd->trace.enabled) {
-                pkt_trace_state_init(&pmd->trace);
+                pkt_trace_state_clear(&pmd->trace);
                 pmd->trace.enabled = true;
             }
             pmd->latency_stats.enabled = enable;
