@@ -2912,6 +2912,191 @@ conntrack_dump_done(struct conntrack_dump *dump OVS_UNUSED)
     return 0;
 }
 
+/* @veencn: Convert internal conn to full ct_dump_entry for binary dump.
+ * Unlike conn_to_ct_dpif_entry(), this preserves nat_action, tp_id,
+ * seq_skew, and TCP seqlo/seqhi/max_win fields. */
+static void
+conn_to_ct_dump_entry(const struct conn *conn, struct ct_dump_entry *entry,
+                      long long now)
+{
+    const struct conn_key *fwd_key = &conn->key_node[CT_DIR_FWD].key;
+    const struct conn_key *rev_key = &conn->key_node[CT_DIR_REV].key;
+
+    memset(entry, 0, sizeof *entry);
+    conn_key_to_tuple(fwd_key, &entry->tuple_orig);
+    conn_key_to_tuple(rev_key, &entry->tuple_reply);
+
+    if (conn->alg_related) {
+        conn_key_to_tuple(&conn->parent_key, &entry->tuple_parent);
+    }
+
+    entry->zone = fwd_key->zone;
+    entry->ip_proto = fwd_key->nw_proto;
+    entry->nat_action = conn->nat_action;
+    entry->tp_id = conn->tp_id;
+    entry->alg_related = conn->alg_related;
+
+    ovs_mutex_lock(&conn->lock);
+    entry->mark = conn->mark;
+    memcpy(&entry->labels, &conn->label, sizeof entry->labels);
+    entry->seq_skew = conn->seq_skew;
+    entry->seq_skew_dir = conn->seq_skew_dir;
+
+    long long expiration = conn_expiration(conn) - now;
+    entry->timeout = (expiration > 0) ? expiration / 1000 : 0;
+
+    if (fwd_key->nw_proto == IPPROTO_TCP) {
+        conn_tcp_get_full_state(conn, entry);
+    }
+    ovs_mutex_unlock(&conn->lock);
+
+    if (conn->alg) {
+        ovs_strlcpy(entry->alg_name, conn->alg, sizeof entry->alg_name);
+    }
+}
+
+/* @veencn: Full dump iterator producing ct_dump_entry (for mmap binary dump).
+ * Same iteration logic as conntrack_dump_next() but with richer output. */
+int
+conntrack_dump_next_full(struct conntrack_dump *dump,
+                         struct ct_dump_entry *entry)
+{
+    long long now = time_msec();
+    struct conn_key_node *keyn;
+    struct conn *conn;
+
+    while (true) {
+        CMAP_CURSOR_FOR_EACH_CONTINUE (keyn, cm_node, &dump->cursor) {
+            if (keyn->dir != CT_DIR_FWD) {
+                continue;
+            }
+            conn = CONTAINER_OF(keyn, struct conn, key_node[CT_DIR_FWD]);
+            if (conn_expired(conn, now)) {
+                continue;
+            }
+            conn_to_ct_dump_entry(conn, entry, now);
+            return 0;
+        }
+
+        if (dump->filter_zone || dump->current_zone == UINT16_MAX) {
+            break;
+        }
+        dump->current_zone++;
+        dump->cursor = cmap_cursor_start(&dump->ct->conns[dump->current_zone]);
+    }
+
+    return EOF;
+}
+
+/* @veencn: Restore a single CT connection from a ct_dump_entry.
+ * Reference: conn_not_found() for connection creation pattern.
+ * Caller must ensure CT is initialized and PMD threads are not yet running
+ * (or hold ct_lock externally). */
+int
+conntrack_restore(struct conntrack *ct, const struct ct_dump_entry *entry,
+                  long long now)
+{
+    struct conn_key fwd_key, rev_key;
+    struct conn *conn;
+    bool reply;
+
+    memset(&fwd_key, 0, sizeof fwd_key);
+    memset(&rev_key, 0, sizeof rev_key);
+    tuple_to_conn_key(&entry->tuple_orig, entry->zone, &fwd_key);
+    tuple_to_conn_key(&entry->tuple_reply, entry->zone, &rev_key);
+
+    /* Dedup check: skip if connection already exists. */
+    if (conn_lookup(ct, &fwd_key, now, &conn, &reply)) {
+        return EEXIST;
+    }
+
+    /* Allocate protocol-specific struct and fill state. */
+    switch (entry->ip_proto) {
+    case IPPROTO_TCP: {
+        struct conn_tcp *ct_conn = xzalloc(sizeof *ct_conn);
+        ct_conn->peer[0].seqlo = entry->tcp.seqlo_orig;
+        ct_conn->peer[0].seqhi = entry->tcp.seqhi_orig;
+        ct_conn->peer[0].max_win = entry->tcp.max_win_orig;
+        ct_conn->peer[0].wscale = entry->tcp.wscale_orig;
+        ct_conn->peer[0].state = entry->tcp.state_orig;
+        ct_conn->peer[1].seqlo = entry->tcp.seqlo_reply;
+        ct_conn->peer[1].seqhi = entry->tcp.seqhi_reply;
+        ct_conn->peer[1].max_win = entry->tcp.max_win_reply;
+        ct_conn->peer[1].wscale = entry->tcp.wscale_reply;
+        ct_conn->peer[1].state = entry->tcp.state_reply;
+        conn = &ct_conn->up;
+        break;
+    }
+    case IPPROTO_ICMP:
+    case IPPROTO_ICMPV6: {
+        struct conn_icmp *ic = xzalloc(sizeof *ic);
+        ic->state = ICMPS_REPLY;  /* Assume established. */
+        conn = &ic->up;
+        break;
+    }
+    default: {
+        struct conn_other *oc = xzalloc(sizeof *oc);
+        oc->state = OTHERS_BIDIR;  /* Assume established. */
+        conn = &oc->up;
+        break;
+    }
+    }
+
+    /* Fill conn base fields. */
+    struct conn_key_node *fwd_node = &conn->key_node[CT_DIR_FWD];
+    struct conn_key_node *rev_node = &conn->key_node[CT_DIR_REV];
+
+    memcpy(&fwd_node->key, &fwd_key, sizeof fwd_key);
+    fwd_node->dir = CT_DIR_FWD;
+    memcpy(&rev_node->key, &rev_key, sizeof rev_key);
+    rev_node->dir = CT_DIR_REV;
+
+    conn->nat_action = entry->nat_action;
+    conn->mark = entry->mark;
+    memcpy(&conn->label, &entry->labels, sizeof conn->label);
+    conn->tp_id = entry->tp_id;
+    conn->seq_skew = entry->seq_skew;
+    conn->seq_skew_dir = entry->seq_skew_dir;
+    conn->alg_related = entry->alg_related;
+    conn->admit_zone = INVALID_ZONE;  /* Skip zone limit on restore. */
+    conn->zone_limit_seq = 0;
+
+    if (entry->alg_name[0] != '\0') {
+        conn->alg = xstrdup(entry->alg_name);
+    }
+
+    if (entry->alg_related) {
+        memset(&conn->parent_key, 0, sizeof conn->parent_key);
+        tuple_to_conn_key(&entry->tuple_parent, entry->zone,
+                          &conn->parent_key);
+    }
+
+    /* Init sync primitives. */
+    ovs_mutex_init_adaptive(&conn->lock);
+    atomic_flag_clear(&conn->reclaimed);
+
+    /* Set expiration. */
+    long long exp_ms = now + (long long) entry->timeout * 1000;
+    atomic_store_relaxed(&conn->expiration, exp_ms);
+
+    /* Insert into cmap with new hash_basis. */
+    uint32_t fwd_hash = conn_key_hash(&fwd_key, ct->hash_basis);
+
+    ovs_mutex_lock(&ct->ct_lock);
+    cmap_insert(&ct->conns[entry->zone], &fwd_node->cm_node, fwd_hash);
+
+    if (conn->nat_action) {
+        uint32_t rev_hash = conn_key_hash(&rev_key, ct->hash_basis);
+        cmap_insert(&ct->conns[entry->zone], &rev_node->cm_node, rev_hash);
+    }
+
+    conn_expire_push_front(ct, conn);
+    ovs_mutex_unlock(&ct->ct_lock);
+
+    atomic_count_inc(&ct->n_conn);
+    return 0;
+}
+
 static void
 exp_node_to_ct_dpif_exp(const struct alg_exp_node *exp,
                         struct ct_dpif_exp *entry)

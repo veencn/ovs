@@ -158,6 +158,47 @@ struct conn {
     uint32_t tp_id; /* Timeout policy ID. */
 };
 
+/* @veencn: TCP peer state, moved from conntrack-tcp.c for restore access. */
+struct tcp_peer {
+    uint32_t               seqlo;          /* Max sequence number sent.     */
+    uint32_t               seqhi;          /* Max the other end ACKd + win. */
+    uint16_t               max_win;        /* Largest window (pre scaling). */
+    uint8_t                wscale;         /* Window scaling factor.        */
+    enum ct_dpif_tcp_state state;
+};
+
+struct conn_tcp {
+    struct conn up;
+    struct tcp_peer peer[2]; /* 'conn' lock protected. */
+};
+
+/* @veencn: Protocol-specific state enums, moved from .c files for restore. */
+enum OVS_PACKED_ENUM other_state {
+    OTHERS_FIRST,
+    OTHERS_MULTIPLE,
+    OTHERS_BIDIR,
+};
+
+struct conn_other {
+    struct conn up;
+    enum other_state state; /* 'conn' lock protected. */
+};
+
+enum OVS_PACKED_ENUM icmp_state {
+    ICMPS_FIRST,
+    ICMPS_REPLY,
+};
+
+struct conn_icmp {
+    struct conn up;
+    enum icmp_state state; /* 'conn' lock protected. */
+};
+
+/* @veencn: Export full TCP peer state for binary CT dump. */
+struct ct_dump_entry;
+void conn_tcp_get_full_state(const struct conn *conn_,
+                             struct ct_dump_entry *dump_entry);
+
 enum ct_update_res {
     CT_UPDATE_INVALID,
     CT_UPDATE_VALID,

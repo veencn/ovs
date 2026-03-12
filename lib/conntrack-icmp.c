@@ -25,15 +25,8 @@
 #include "conntrack-tp.h"
 #include "dp-packet.h"
 
-enum OVS_PACKED_ENUM icmp_state {
-    ICMPS_FIRST,
-    ICMPS_REPLY,
-};
-
-struct conn_icmp {
-    struct conn up;
-    enum icmp_state state; /* 'conn' lock protected. */
-};
+/* @veencn: enum icmp_state and struct conn_icmp moved to conntrack-private.h
+ * for cross-file access during CT restore. */
 
 static const enum ct_timeout icmp_timeouts[] = {
     [ICMPS_FIRST] = CT_TM_ICMP_FIRST,

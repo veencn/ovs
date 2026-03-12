@@ -353,4 +353,66 @@ int ct_dpif_get_features(struct dpif *dpif, enum ct_features *features);
 void ct_dpif_set_zone_limit_protection(struct dpif *, bool protected);
 bool ct_dpif_is_zone_limit_protected(struct dpif *);
 
+/* @veencn: CT binary dump/restore for Phase 1 hot upgrade (mmap-based). */
+
+#define CT_DUMP_MAGIC   0x4F56534354ULL  /* "OVSCT" */
+#define CT_DUMP_VERSION 1
+
+struct ct_dump_file_header {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t entry_size;      /* sizeof(struct ct_dump_entry) */
+    uint64_t n_entries;
+    uint64_t timestamp_ms;    /* time_msec() at dump time */
+    uint8_t  reserved[32];    /* Pad to 64 bytes. */
+};
+BUILD_ASSERT_DECL(sizeof(struct ct_dump_file_header) == 64);
+
+/* Full CT entry for binary dump (superset of ct_dpif_entry).
+ * Fixed-size struct for direct mmap array indexing. */
+struct ct_dump_entry {
+    /* Connection tuples. */
+    struct ct_dpif_tuple tuple_orig;
+    struct ct_dpif_tuple tuple_reply;
+    struct ct_dpif_tuple tuple_parent;   /* ALG parent (zeroed if unused). */
+
+    /* Metadata. */
+    uint16_t zone;
+    uint32_t mark;
+    ovs_u128 labels;
+    uint32_t timeout;         /* Remaining timeout in seconds. */
+    uint16_t nat_action;      /* NAT_ACTION_* bitmask (missing in ct_dpif_entry). */
+    uint32_t tp_id;           /* Timeout policy ID (missing in ct_dpif_entry). */
+    bool     alg_related;
+
+    /* Protocol info. */
+    uint8_t  ip_proto;        /* IPPROTO_TCP / IPPROTO_UDP / ... */
+    struct {
+        uint8_t  state_orig;
+        uint8_t  state_reply;
+        uint8_t  wscale_orig;
+        uint8_t  wscale_reply;
+        uint8_t  flags_orig;
+        uint8_t  flags_reply;
+        /* Fields below are missing from ct_dpif_protoinfo but required
+         * to correctly restore TCP connections. */
+        uint32_t seqlo_orig;
+        uint32_t seqhi_orig;
+        uint16_t max_win_orig;
+        uint32_t seqlo_reply;
+        uint32_t seqhi_reply;
+        uint16_t max_win_reply;
+    } tcp;
+
+    /* TCP sequence skew (ALG-induced). */
+    int32_t  seq_skew;
+    bool     seq_skew_dir;
+
+    /* ALG helper name (inline, max "sip\0"). */
+    char     alg_name[16];
+
+    /* Padding for 8-byte alignment. */
+    uint8_t  pad[2];
+};
+
 #endif /* CT_DPIF_H */
