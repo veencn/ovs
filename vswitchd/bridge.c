@@ -3385,6 +3385,33 @@ bridge_run(void)
          * with the current situation of multiple ovs-vswitchd daemons,
          * disable system stats collection. */
         system_stats_enable(false);
+
+        /* @veencn: Phase 2 hot upgrade - pre-initialize DPDK EAL while
+         * waiting for OVSDB lock. When lock holder exits, we skip EAL
+         * init (dpdk_init() is idempotent) and proceed directly to
+         * bridge_reconfigure(), reducing handover latency.
+         *
+         * daemonize_complete() notifies the parent process (--detach)
+         * that the standby child is alive and ready. Safe to call here
+         * because daemonize_complete() has an internal !detached guard. */
+        {
+            static bool standby_eal_inited = false;
+            if (!standby_eal_inited) {
+                const struct ovsrec_open_vswitch *standby_cfg =
+                    ovsrec_open_vswitch_first(idl);
+                if (standby_cfg) {
+                    dpdk_set_standby_mode(true);
+                    dpdk_init(&standby_cfg->other_config);
+                    standby_eal_inited = true;
+                    daemonize_complete();
+                    VLOG_INFO("standby: %s, awaiting lock (pid %ld)",
+                              dpdk_available()
+                                  ? "EAL pre-initialized"
+                                  : "ready (no DPDK)",
+                              (long int) getpid());
+                }
+            }
+        }
         return;
     } else if (!ovsdb_idl_has_lock(idl)
                || !ovsdb_idl_has_ever_connected(idl)) {

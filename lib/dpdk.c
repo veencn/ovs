@@ -48,6 +48,10 @@ static FILE *log_stream = NULL;       /* Stream for DPDK log redirection */
 /* Indicates successful initialization of DPDK. */
 static atomic_bool dpdk_initialized = false;
 
+/* @veencn: Standby mode uses PID-based --file-prefix to isolate
+ * hugepage runtime directory from the running primary process. */
+static bool dpdk_standby_mode = false;
+
 static bool
 args_contains(const struct svec *args, const char *value)
 {
@@ -391,6 +395,18 @@ dpdk_init__(const struct smap *ovs_other_config)
     svec_add(&args, ovs_get_program_name());
     construct_dpdk_args(ovs_other_config, &args);
 
+    /* @veencn: In standby mode, use PID-based file-prefix to avoid
+     * hugepage directory conflict (/var/run/dpdk/<prefix>/) with the
+     * running primary process.  PCI bus IS scanned (auto-probe will
+     * fail with VFIO busy — harmless), so device entries exist for
+     * later rte_dev_probe() retries after lock acquisition. */
+    if (dpdk_standby_mode && !args_contains(&args, "--file-prefix")) {
+        char prefix[32];
+        snprintf(prefix, sizeof prefix, "ovs_%ld", (long)getpid());
+        svec_add(&args, "--file-prefix");
+        svec_add(&args, prefix);
+    }
+
 #ifdef DPDK_IN_MEMORY_SUPPORTED
     if (!args_contains(&args, "--in-memory") &&
             !args_contains(&args, "--legacy-mem")) {
@@ -552,6 +568,14 @@ dpdk_available(void)
 
     atomic_read_relaxed(&dpdk_initialized, &initialized);
     return initialized;
+}
+
+/* @veencn: Enable standby mode before dpdk_init() to use isolated
+ * DPDK file-prefix. Called from bridge_run() lock-contended path. */
+void
+dpdk_set_standby_mode(bool standby)
+{
+    dpdk_standby_mode = standby;
 }
 
 bool

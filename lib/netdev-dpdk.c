@@ -2090,8 +2090,24 @@ netdev_dpdk_process_devargs(struct netdev_dpdk *dev,
     } else {
         new_port_id = netdev_dpdk_get_port_by_devargs(devargs);
         if (!rte_eth_dev_is_valid_port(new_port_id)) {
-            /* Device not found in DPDK, attempt to attach it */
-            if (rte_dev_probe(devargs)) {
+            /* Device not found in DPDK, attempt to attach it.
+             * @veencn: Retry with backoff — during hot upgrade the
+             * exiting primary may still hold the VFIO group fd when
+             * the standby first tries to probe.  Retries are cheap
+             * (port creation is not a hot path) and only triggered
+             * when the initial probe fails. */
+            int probe_retries = 40;  /* up to ~2 s total */
+            int probe_err;
+
+            probe_err = rte_dev_probe(devargs);
+            while (probe_err && probe_retries-- > 0) {
+                VLOG_INFO("Device '%s' probe failed, retrying "
+                          "(%d left)...", devargs, probe_retries);
+                usleep(50000);   /* 50 ms */
+                probe_err = rte_dev_probe(devargs);
+            }
+
+            if (probe_err) {
                 new_port_id = DPDK_ETH_PORT_ID_INVALID;
             } else {
                 new_port_id = netdev_dpdk_get_port_by_devargs(devargs);

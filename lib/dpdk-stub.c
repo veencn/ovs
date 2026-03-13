@@ -68,3 +68,8 @@ dpdk_status(const struct ovsrec_open_vswitch *cfg)
         ovsrec_open_vswitch_set_dpdk_version(cfg, "none");
     }
 }
+
+void
+dpdk_set_standby_mode(bool standby OVS_UNUSED)
+{
+}

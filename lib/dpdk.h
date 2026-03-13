@@ -41,5 +41,6 @@ void dpdk_detach_thread(void);
 bool dpdk_available(void);
 void print_dpdk_version(void);
 void dpdk_status(const struct ovsrec_open_vswitch *);
+void dpdk_set_standby_mode(bool standby);   /* @veencn */
 
 #endif /* dpdk.h */
